@@ -11,6 +11,11 @@
 #   share.sh start [name]   同上（可指定会话名，默认 ai）
 #   share.sh serve [name]   仅启动 Web 服务（共享一个已存在的 tmux 会话，适合已在会话里干活时另开终端调用）
 #   share.sh here [name]    在会话内一键共享：自动识别"当前所在的" tmux 会话并起服务（无需另开终端、无需记会话名）
+#   share.sh new [opts] <命令...>  新建托管会话（不依赖 tmux）：起服务+打印链接+进入会话；
+#                                  进程退出（如 Claude 里 /exit）后网页会话自动结束。opts：--no-attach 不进入
+#   share.sh attach <id>    本机终端连接到托管会话（关闭终端不会结束会话）
+#   share.sh kill <id>      强制结束托管会话
+#   share.sh sessions       全局查看所有活动中的会话与状态（托管/ttyd/Claude/atomcode）
 #   share.sh stop [name]    停止 Web 服务（tmux 会话保留，可再 serve 恢复）
 #   share.sh status [name]  查看服务状态
 #   share.sh url [name]     打印当前访问链接与认证信息
@@ -23,7 +28,9 @@
 #   SS_PORT      服务端口（默认 7681；被占用且未显式指定时自动顺延）
 #   SS_HOST      监听地址（默认 0.0.0.0）
 #   SS_HUB_PORT  会话监控面板端口（默认 7690）
-#   SS_NO_AUTH   设为 1 关闭登录认证（不推荐，见 README 安全章节）
+#   SS_HUB_URL   面板地址环境变量（install.sh 写入 shell rc，全局发现用）
+#   SS_HUB_TOKEN 面板认证 token 的环境变量兜底（hub.state 不可用时）
+#   SS_NO_AUTH   设 1 关闭登录认证（不推荐，见 README 安全章节）
 #
 # 依赖：tmux、ttyd、openssl、python3（install.sh 可一键安装）
 # 状态文件：~/.ai-session-share/<session>.{pid,state,log} 与 hub.{pid,state,log}，本机自用，不入库。
@@ -253,17 +260,17 @@ stop_ttyd() {
 
 # ---------- 输出访问信息 ----------
 print_urls() {
-    local port="$1" token="${2:-}"
+    local port="$1" token="${2:-}" path="${3:-}"
     local ips=() ip
     while IFS= read -r ip; do
         [[ -n "$ip" ]] && ips+=("$ip")
     done < <(lan_ips)
 
     if [[ ${#ips[@]} -eq 0 ]]; then
-        log_warn "  未检测到局域网 IP，请手动确认本机 IP 后用 http://<IP>:${port} 访问"
+        log_warn "  未检测到局域网 IP，请手动确认本机 IP 后用 http://<IP>:${port}${path} 访问"
     else
         for ip in "${ips[@]}"; do
-            log "  局域网访问: http://${ip}:${port}"
+            log "  局域网访问: http://${ip}:${port}${path}"
         done
     fi
 
@@ -272,7 +279,7 @@ print_urls() {
         if [[ ${#ips[@]} -gt 0 ]]; then
             log "  一键登录（点击即用，无需手输密码）:"
             for ip in "${ips[@]}"; do
-                log "    http://${AUTH_USER}:${token}@${ip}:${port}"
+                log "    http://${AUTH_USER}:${token}@${ip}:${port}${path}"
             done
         fi
         log "  提示: 密码在每次 start/serve 时都会重新生成；若提示密码错误，"
@@ -415,33 +422,51 @@ cmd_hub_start() {
     if [[ "${SS_NO_AUTH:-0}" != "1" ]]; then
         hub_token="$(gen_token)"
     fi
-    SS_HUB_PORT="$HUB_PORT" SS_HUB_TOKEN="$hub_token" \
+    # SS_HUB_DAEMON=1:hub_server.py 双 fork+setsid 自守护,状态文件(hub.pid/hub.state)
+    # 由最终守护进程在绑定成功后自己写 —— 启动方只需轮询等待,不再代写(避免 pid 不符)。
+    SS_HUB_DAEMON=1 SS_HUB_PORT="$HUB_PORT" SS_HUB_TOKEN="$hub_token" \
         nohup python3 "${REPO_DIR}/hub_server.py" >"$(hub_log_path)" 2>&1 &
-    local hub_pid=$!
-    sleep 1
-    if ! kill -0 "$hub_pid" 2>/dev/null; then
+    # 等待守护进程就绪(最长 5s:pid 文件出现且进程存活)
+    local waited=0
+    while ! hub_is_running && [[ $waited -lt 50 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if ! hub_is_running; then
         log_err "监控面板启动失败，日志见: $(hub_log_path)"
         log_err "--- 最近日志 ---"
         tail -n 5 "$(hub_log_path)" >&2 || true
         return 1
     fi
-    echo "$hub_pid" > "$(hub_pid_path)"
-    cat > "$(hub_state_path)" <<EOF
-port=${HUB_PORT}
-token=${hub_token}
-started=$(date '+%Y-%m-%d %H:%M:%S')
-EOF
-    log_ok "会话监控面板已启动（PID ${hub_pid}）"
+    hub_load_state
+    log_ok "会话监控面板已启动（PID $(cat "$(hub_pid_path)" 2>/dev/null)）"
     echo
     log "浏览器访问（可查看所有运行中的会话）："
     print_urls "$HUB_PORT" "$hub_token"
     echo
-    log_ok "面板监控: tmux 会话 / Claude Code 会话(实时网页视图) / atomcode 活动"
+    log_ok "全局环境变量（新终端自动生效，见 install.sh）: SS_HUB_URL=http://127.0.0.1:${HUB_PORT}"
+    log_ok "活动会话一览: share sessions    本机 MCP 接入: python3 ${REPO_DIR}/mcp_server.py"
+    log_ok "面板监控: tmux 会话 / 托管会话(免 tmux) / Claude Code 会话(实时网页视图) / atomcode 活动"
     log_ok "停止面板: share.sh hub stop"
 }
 
 cmd_hub_stop() {
     if hub_is_running; then
+        # 托管会话存活于面板进程内:面板退出会一并结束它们,有存活会话时阻止误停
+        local running=0
+        if command -v python3 >/dev/null 2>&1; then
+            running="$(python3 "${REPO_DIR}/hub_server.py" api state 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(sum(1 for x in d.get("managed", []) if not x.get("exited")))
+except Exception:
+    print(0)' 2>/dev/null)" || running=""
+            [[ "$running" =~ ^[0-9]+$ ]] || running=0
+        fi
+        if [[ "$running" -gt 0 && "${SS_FORCE:-0}" != "1" ]]; then
+            die "还有 ${running} 个运行中的托管会话,停止面板会一并结束它们;确认请用: SS_FORCE=1 share.sh hub stop"
+        fi
         local pid
         pid="$(cat "$(hub_pid_path)" 2>/dev/null)"
         kill "$pid" 2>/dev/null || true
@@ -479,6 +504,89 @@ cmd_hub_url() {
         die "会话监控面板未在运行，先执行: share.sh hub start"
     fi
     print_urls "${HUB_STATE_PORT:-$HUB_PORT}" "${HUB_STATE_TOKEN:-}"
+}
+
+# ---------- 托管会话(自管 PTY,不依赖 tmux/ttyd)----------
+# 会话由 hub 进程托管:本机与所有浏览器共用同一个 PTY,双向操作;
+# 生命周期与会话进程严格绑定 —— 进程退出(如 Claude 里 /exit)后网页会话自动结束。
+cmd_new() {
+    need_cmds python3
+    local no_attach=0 args=()
+    # 已知 cmd_new 收到的是命令及参数(首个 "new" 已在 main 中 shift 掉)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-attach) no_attach=1 ;;
+            --) shift; args+=("$@"); break ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+    if [[ ${#args[@]} -eq 0 ]]; then
+        args=("${SHELL:-/bin/bash}")
+    fi
+
+    if ! hub_is_running; then
+        if ! cmd_hub_start >/dev/null 2>&1; then
+            log_err "会话监控面板启动失败，日志见: $(hub_log_path)"
+            return 1
+        fi
+    fi
+    hub_load_state
+
+    local hub_json sid
+    hub_json="$(python3 "${REPO_DIR}/hub_server.py" api new "$PWD" "${args[@]}")" \
+        || { log_err "创建托管会话失败"; return 1; }
+    sid="$(echo "$hub_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+    if [[ -z "$sid" ]]; then
+        log_err "创建托管会话失败: ${hub_json}"
+        return 1
+    fi
+
+    echo
+    log "托管会话已创建: ${sid}"
+    log "  命令: ${args[*]}"
+    echo
+    log "浏览器访问（手机也可，双向操作同一会话）:"
+    print_urls "${HUB_STATE_PORT:-$HUB_PORT}" "${HUB_STATE_TOKEN:-}" "/w/${sid}"
+    echo
+    log_ok "生命周期: 会话内 /exit 或进程退出后，网页会话自动结束（无需 stop）。"
+    log_ok "本机再次进入: share attach ${sid}    强制结束: share kill ${sid}"
+    if [[ $no_attach -eq 0 && -t 0 ]]; then
+        echo
+        log_ok "进入会话（直接关闭本终端不会结束会话，浏览器仍可继续）..."
+        exec python3 "${REPO_DIR}/hub_attach.py" "$sid"
+    else
+        log "本地连接: share attach ${sid}"
+    fi
+}
+
+cmd_attach() {
+    need_cmds python3
+    local sid="${1:-}"
+    [[ -n "$sid" ]] || die "用法: share attach <托管会话id>  (id 来自 share new 输出或监控面板)"
+    exec python3 "${REPO_DIR}/hub_attach.py" "$sid"
+}
+
+cmd_kill() {
+    need_cmds python3
+    local sid="${1:-}"
+    [[ -n "$sid" ]] || die "用法: share kill <托管会话id>"
+    if ! hub_is_running; then
+        die "会话监控面板未在运行"
+    fi
+    python3 "${REPO_DIR}/hub_server.py" api kill "$sid" >/dev/null \
+        || { log_err "结束失败（会话可能已结束）"; return 1; }
+    log_ok "已请求结束托管会话 ${sid}（网页端将同步显示已结束）"
+}
+
+# 全局活动会话视图:托管/ttyd/Claude/atomcode 一屏尽览(格式化在 hub_server.py api sessions)
+cmd_sessions() {
+    need_cmds python3
+    if ! hub_is_running; then
+        log_warn "会话监控面板未在运行（仅显示提示），建议: share hub start"
+        return 1
+    fi
+    python3 "${REPO_DIR}/hub_server.py" api sessions
 }
 
 cmd_doctor() {
@@ -519,7 +627,7 @@ cmd_doctor() {
 }
 
 cmd_help() {
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------- 入口 ----------
@@ -529,7 +637,7 @@ main() {
     SESSION="$DEFAULT_SESSION"
 
     case "$cmd" in
-        start|serve|stop|status|url|doctor|help|-h|--help)
+        start|serve|stop|status|url|doctor|help|-h|--help|sessions)
             if [[ -n "${2:-}" ]]; then
                 SESSION="$2"
             fi
@@ -540,8 +648,8 @@ main() {
                 HERE_EXPLICIT=1
             fi
             ;;
-        hub)
-            ;;  # hub 的次参是动作(start/stop/status/url)，不是会话名
+        hub|new|attach|kill)
+            ;;  # 次参不是会话名:hub→动作、new→命令、attach/kill→托管会话 id
         *)
             cmd="start"
             SESSION="$1"
@@ -569,6 +677,10 @@ main() {
         stop)   cmd_stop ;;
         status) cmd_status ;;
         url)    cmd_url ;;
+        new)    shift; cmd_new "$@" ;;
+        attach) cmd_attach "${2:-}" ;;
+        kill)   cmd_kill "${2:-}" ;;
+        sessions) cmd_sessions ;;
         doctor) cmd_doctor ;;
         help|-h|--help) cmd_help ;;
         *) die "未知命令: $cmd" ;;

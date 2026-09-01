@@ -6,6 +6,7 @@
   - tmux 会话列表(可从网页一键起 ttyd 共享,双向操作)
   - Claude Code 会话列表(~/.claude/projects/**/**.jsonl,实时网页视图)
   - atomcode 会话活动(~/.atomcode/datalog/**,原始日志尾部视图)
+  - 托管会话(自管 PTY,不依赖 tmux/ttyd;进程退出网页会话自动结束)
   - 已在共享中的 ttyd 服务清单(端口/链接)
 
 设计原则:只用 Python 标准库,无任何第三方依赖;
@@ -14,6 +15,14 @@ Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次�
 路由:
   GET  /                       仪表盘(5s 自动刷新)
   GET  /api/state             仪表盘数据 JSON
+  GET  /api/ticket            申请 WebSocket 一次性票据(替代无法带 Basic Auth 的 WS)
+  GET  /api/session/<id>      托管会话详情(状态+输出预览)
+  GET  /api/output/<id>?tail= 托管会话最近输出(程序化读取)
+  POST /api/send/<id>         向托管会话发送键盘输入(程序化操作)
+  GET  /w/<managed-id>        托管会话网页终端(xterm.js,双向)
+  GET  /ws/<managed-id>?t=..  托管会话 WebSocket(PTY 直通)
+  POST /api/new               新建托管会话 {argv:[...], cwd} 或 {cmd:"bash"}
+  POST /api/kill/<managed-id> 强制结束托管会话
   GET  /t/<claude-session-id> Claude 会话实时视图(2s 轮询)
   GET  /t/<id>/data           Claude 会话消息 JSON
   GET  /t/a-<atomcode-slug>   atomcode 会话原始日志尾部(5s meta 刷新)
@@ -28,16 +37,32 @@ Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次�
   SS_STATE_DIR   状态目录(默认 ~/.ai-session-share)
 """
 import base64
+import fcntl
+import hashlib
 import hmac
 import html
 import json
 import os
 import re
+import secrets
+import shutil
+import signal
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    import pty
+except ImportError:  # 仅 POSIX;Windows 原生不支持(WSL 下可用)
+    pty = None
 
 HOME = Path.home()
 HUB_PORT = int(os.environ.get("SS_HUB_PORT", "7690"))
@@ -51,19 +76,9 @@ LIVE_SEC = 15 * 60          # 会话最后活动在 15 分钟内视为「活跃�
 MAX_MSGS = 400              # 会话视图最多渲染的消息条数
 MAX_PART = 4000              # 单条消息文本截断
 TAIL_BYTES = 96 * 1024      # atomcode 原始日志尾部读取量
+MAX_MANAGED = 32            # 托管会话数量上限(防 API 滥用)
 
 TOKEN = os.environ.get("SS_HUB_TOKEN", "")
-if not TOKEN and not NO_AUTH:
-    import secrets
-    TOKEN = secrets.token_hex(16)
-    # 直接运行时自写状态文件,保证 share.sh hub url / hook 能读到同一份 token
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        (STATE_DIR / "hub.state").write_text(
-            f"port={HUB_PORT}\ntoken={TOKEN}\nstarted={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -277,6 +292,313 @@ def find_claude_jsonl(session_id):
     return None
 
 
+# ------------------------------------------------- WebSocket(标准库最小实现)
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# TIOCSWINSZ:macOS 0x80087467 / Linux 0x5414
+TIOCSWINSZ = 0x80087467 if sys.platform == "darwin" else 0x5414
+
+
+class WSConn:
+    """服务端 WebSocket 连接(仅实现本协议所需的最小子集)。
+
+    协议(与 hub_attach / /w 页面 / tests/hub_ws_probe 一致):
+      客户端 → 服务端: 文本帧 = 键盘输入;二进制帧 = 控制JSON(init/resize)
+      服务端 → 客户端: 二进制帧 = 终端原始输出;文本帧 = 控制JSON(ended)
+    """
+
+    def __init__(self, sock, rfile):
+        self.sock = sock
+        self.rfile = rfile
+        self.wlock = threading.Lock()
+        self.closed = False
+
+    def send(self, opcode, payload: bytes):
+        if self.closed:
+            return
+        n = len(payload)
+        header = bytearray([0x80 | opcode])
+        if n < 126:
+            header.append(n)
+        elif n < 65536:
+            header.append(126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(127)
+            header += struct.pack(">Q", n)
+        try:
+            with self.wlock:
+                self.sock.sendall(bytes(header) + payload)
+        except OSError:
+            self.closed = True
+
+    def send_binary(self, data: bytes):
+        self.send(0x2, data)
+
+    def send_text(self, s: str):
+        self.send(0x1, s.encode())
+
+    def close(self):
+        if not self.closed:
+            self.send(0x8, b"")
+        self.closed = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _read_exact(self, n):
+        if n == 0:
+            return b""
+        data = self.rfile.read(n)
+        if data is None or len(data) < n:
+            return None
+        return data
+
+    def recv(self):
+        """返回 (opcode, payload);连接关闭/出错返回 None。自动应答 ping。"""
+        while True:
+            hdr = self._read_exact(2)
+            if hdr is None:
+                return None
+            b1, b2 = hdr[0], hdr[1]
+            opcode = b1 & 0x0F
+            masked = b2 & 0x80
+            ln = b2 & 0x7F
+            off = 2
+            if ln == 126:
+                ext = self._read_exact(2)
+                if ext is None:
+                    return None
+                ln = struct.unpack(">H", ext)[0]
+                off = 4
+            elif ln == 127:
+                ext = self._read_exact(8)
+                if ext is None:
+                    return None
+                ln = struct.unpack(">Q", ext)[0]
+                off = 10
+            if ln > (1 << 20):
+                return None
+            mask = self._read_exact(4) if masked else b""
+            data = self._read_exact(ln)
+            if data is None:
+                return None
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:      # close
+                return None
+            if opcode == 0x9:      # ping → pong
+                self.send(0xA, data)
+                continue
+            if opcode == 0xA:       # pong
+                continue
+            return opcode, data
+
+
+# ------------------------------------------------- 托管会话(自管 PTY,免 tmux)
+class ManagedSession:
+    """一个由本服务托管的 PTY 会话。
+
+    生命周期与会话进程严格绑定:进程退出(如 Claude 里 /exit)→
+    会话自动结束、网页端同步收到 ended、入口页变为"已结束",无需任何 stop。
+    关闭本地终端/浏览器不会结束会话 —— 会话存活于 hub 进程中。
+    """
+
+    REPLAY_MAX = 256 * 1024     # 新连接可回放的最近输出量(浏览器/attach 晚到也能看到历史)
+
+    def __init__(self, sid, argv, cwd=None):
+        self.id = sid
+        self.argv = list(argv)
+        self.conns = set()
+        self.lock = threading.Lock()
+        self.started = time.time()
+        self.exited = None       # 退出时间戳;None = 运行中
+        self.buf = []            # 输出回放缓存(新连接可见此前输出)
+        self.buf_bytes = 0
+        env = dict(os.environ)
+        env["SS_MANAGED_ID"] = sid   # hook 据此识别:AI 工具运行在托管会话里
+        pid, fd = pty.fork()
+        if pid == 0:
+            # 子进程:切到指定目录;关闭继承的其他 fd(hub 监听 socket、其他会话的
+            # PTY master 等 —— 否则其他进程持有 master 会导致会话退出时收不到 EOF)
+            try:
+                if cwd:
+                    os.chdir(cwd)
+            except OSError:
+                pass
+            try:
+                os.closerange(3, 1 << 16)
+            except OSError:
+                pass
+            try:
+                os.execvpe(self.argv[0], self.argv, env)
+            except OSError:
+                pass
+            os._exit(127)
+        self.pid = pid
+        self.fd = fd
+        self.set_winsize(80, 24)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def info(self):
+        return {
+            "id": self.id,
+            "cmd": " ".join(self.argv),
+            "pid": self.pid,
+            "started": self.started,
+            "clients": len(self.conns),
+            "exited": self.exited is not None,
+        }
+
+    def set_winsize(self, cols, rows):
+        try:
+            fcntl.ioctl(self.fd, TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def write(self, data: bytes):
+        if self.exited is None:
+            try:
+                os.write(self.fd, data)
+            except OSError:
+                pass
+
+    def add_conn(self, ws):
+        with self.lock:
+            self.conns.add(ws)
+            replay = b"".join(self.buf)
+        if replay:
+            ws.send_binary(replay)   # 晚到的浏览器/attach 也能看到之前的输出
+
+    def remove_conn(self, ws):
+        with self.lock:
+            self.conns.discard(ws)
+
+    def tail(self, n=4096):
+        """最近 n 字节的终端输出(含 ANSI 转义),供 HTTP/MCP 读取。"""
+        with self.lock:
+            data = b"".join(self.buf)
+        return data[-n:]
+
+    def terminate(self, grace=1.5):
+        """可靠结束会话进程树:SIGTERM 进程组 → 宽限等待 → SIGKILL 进程组。
+
+        必须按进程组杀(pty.fork 的子进程经 setsid 是组长):交互式 bash 会忽略
+        SIGTERM,只杀主进程会留下孤儿;组杀可连带其派生的所有子进程。
+        """
+        if self.exited is not None:
+            return
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 1.0)):
+            try:
+                os.killpg(self.pid, sig)
+            except OSError:
+                try:
+                    os.kill(self.pid, sig)
+                except OSError:
+                    return
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                if self.exited is not None:
+                    return
+                time.sleep(0.05)
+
+    def _broadcast(self, data: bytes):
+        with self.lock:
+            self.buf.append(data)
+            self.buf_bytes += len(data)
+            while self.buf_bytes > self.REPLAY_MAX and len(self.buf) > 1:
+                self.buf_bytes -= len(self.buf[0])
+                self.buf.pop(0)
+            conns = list(self.conns)
+        for c in conns:
+            c.send_binary(data)
+
+    def _broadcast_control(self, obj):
+        payload = json.dumps(obj, ensure_ascii=False)
+        with self.lock:
+            conns = list(self.conns)
+        for c in conns:
+            c.send_text(payload)
+
+    def _reader(self):
+        """PTY 读线程:输出广播给所有连接;EOF(进程退出)→ 会话自动结束。"""
+        try:
+            while True:
+                try:
+                    data = os.read(self.fd, 65536)
+                except OSError:
+                    break          # Linux: 子进程退出后 read 返回 EIO
+                if not data:
+                    break           # macOS: EOF
+                self._broadcast(data)
+        finally:
+            self.exited = time.time()
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self._broadcast_control({"type": "ended"})
+            with self.lock:
+                conns = list(self.conns)
+            for c in conns:
+                c.close()
+
+
+class ManagedSessions:
+    """托管会话注册表;结束后保留 120s 供查看,再自动清理。"""
+
+    RETAIN_ENDED_SEC = 120
+
+    def __init__(self):
+        self.sessions = {}
+        self.lock = threading.Lock()
+
+    def spawn(self, argv, cwd=None):
+        if pty is None:
+            raise RuntimeError("当前平台不支持 pty,无法创建托管会话")
+        sid = "m" + secrets.token_hex(5)
+        sess = ManagedSession(sid, argv, cwd)
+        with self.lock:
+            self.sessions[sid] = sess
+        return sess
+
+    def get(self, sid):
+        self._gc()
+        return self.sessions.get(sid)
+
+    def _gc(self):
+        now = time.time()
+        with self.lock:
+            dead = [k for k, s in self.sessions.items()
+                    if s.exited is not None and now - s.exited > self.RETAIN_ENDED_SEC]
+            for k in dead:
+                del self.sessions[k]
+
+    def list(self):
+        self._gc()
+        with self.lock:
+            return [s.info() for s in self.sessions.values()]
+
+    def running_count(self):
+        return sum(1 for s in self.list() if not s["exited"])
+
+    def kill_all(self):
+        for s in self.list():
+            if not s["exited"]:
+                sess = self.sessions.get(s["id"])
+                if sess:
+                    sess.terminate(grace=0.5)
+
+
+MANAGED = ManagedSessions()
+TICKETS = {}   # 一次性 WS 票据:{token: 签发时间}
+
+
+
 # ---------------------------------------------------------------- HTML 模板
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -326,8 +648,27 @@ async function load(){
     if(s.shared.length)
       h += `<div class="card"><h2>📡 共享中的终端服务</h2><table>
         <tr><th>tmux 会话</th><th>端口</th><th>链接</th></tr>${s.shared.map(sharedRow).join('')}</table></div>`;
+    if(s.managed && s.managed.length){
+      h += `<div class="card"><h2>🎮 托管会话 — 免 tmux,进程退出(如 /exit)自动结束</h2><table>
+        <tr><th>会话</th><th>命令</th><th>PID</th><th>客户端</th><th>状态</th><th></th></tr>` +
+        s.managed.map(x=>`<tr><td class="mono">${x.id}</td><td class="mono">${_esc_js(x.cmd)}</td>
+          <td class="dim">${x.pid}</td><td>${x.clients}</td>
+          <td>${x.exited?'<span class="off">■ 已结束</span>':'<span class="ok">● 运行中</span>'}</td>
+          <td>${x.exited?'':`<a href="/w/${x.id}" target="_blank">打开终端 ↗</a>
+            <button onclick="killS('${x.id}',this)">结束</button>`}</td></tr>`).join('') +
+        `</table></div>`;
+    }
+    if(s.presets && s.presets.length){
+      h += `<div class="card"><h2>➕ 新建托管会话</h2><div style="padding:12px 16px">
+        <select id="newcmd" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;
+border-radius:6px;padding:5px 8px;font:13px ui-monospace,monospace">` +
+        s.presets.map(c=>`<option>${c}</option>`).join('') + `</select>
+        <button onclick="newS(this)">新建并打开</button>
+        <span class="dim" style="font-size:12px">不依赖 tmux;进程退出后会话自动结束;本机连接用 share attach &lt;id&gt;</span>
+        </div></div>`;
+    }
     if(s.tmux.length){
-      h += `<div class="card"><h2>⌨ tmux 会话(可共享为双向终端)</h2><table>
+      h += `<div class="card"><h2>⌨ tmux 会话(旧模式,可共享为双向终端)</h2><table>
         <tr><th>会话</th><th>创建于</th><th>窗口</th><th>本机连接</th><th>状态</th><th></th></tr>` +
         s.tmux.map(x=>`<tr><td class="mono">${x.name}</td><td class="dim">${x.created}</td>
           <td>${x.windows}</td><td>${x.attached?'已连接':'后台'}</td>
@@ -343,7 +684,7 @@ async function load(){
           <td class="mono">${x.id.slice(0,8)}…</td><td class="dim">${fmtSize(x.size)}</td>
           <td>${x.live?'<span class="ok">● 活跃</span>':'<span class="off">○ '+ago(x.mtime)+'</span>'}</td>
           <td><a href="${x.url}" target="_blank">查看会话 ↗</a></td></tr>`).join('') +
-        `</table><div class="sub" style="padding:8px 16px">在 tmux 会话里运行的 Claude 可双向操作;普通终端里的 Claude 为只读实时视图。</div></div>`;
+        `</table><div class="sub" style="padding:8px 16px">在托管会话或 tmux 会话里运行的 Claude 可双向操作;普通终端里的 Claude 为只读实时视图。</div></div>`;
     }
     if(s.atomcode.length){
       h += `<div class="card"><h2>⚛ atomcode 会话(原始日志)</h2><table>
@@ -360,11 +701,29 @@ async function load(){
 async function share(name, btn){
   btn.disabled = true; btn.textContent = '启动中…';
   try{
-    const r = await fetch('/api/share/'+name, {method:'POST'});
+    const r = await fetch('/api/share/'+name, {method:'POST', headers:{'X-Share-API':'1'}});
     const j = await r.json();
     btn.textContent = j.ok ? '已启动 ✓' : '失败';
     setTimeout(load, 800);
   }catch(e){ btn.textContent = '失败'; }
+}
+async function newS(btn){
+  btn.disabled = true; btn.textContent = '创建中…';
+  try{
+    const cmd = document.getElementById('newcmd').value;
+    const r = await fetch('/api/new', {method:'POST', headers:{'X-Share-API':'1'},
+      body: JSON.stringify({cmd: cmd})});
+    const j = await r.json();
+    if (j.ok){ window.open(j.url, '_blank'); setTimeout(load, 600); }
+    else alert('创建失败: ' + (j.error||''));
+  }catch(e){ alert('创建失败: '+e); }
+  btn.disabled = false; btn.textContent = '新建并打开';
+}
+async function killS(id, btn){
+  if (!confirm('结束该托管会话?')) return;
+  btn.disabled = true;
+  try{ await fetch('/api/kill/'+id, {method:'POST', headers:{'X-Share-API':'1'}}); }catch(e){}
+  setTimeout(load, 500);
 }
 function fmtSize(n){ return n>1048576 ? (n/1048576).toFixed(1)+' MB' : n>1024 ? (n/1024).toFixed(0)+' KB' : n+' B'; }
 function ago(ts){ const s=Math.floor(Date.now()/1000-ts); return s<3600?Math.floor(s/60)+' 分钟前':s<86400?Math.floor(s/3600)+' 小时前':Math.floor(s/86400)+' 天前'; }
@@ -434,6 +793,93 @@ margin-top:16px;font-size:12px;overflow:auto;white-space:pre-wrap;word-break:bre
     return page(f"atomcode {slug}", body, refresh=5)
 
 
+# 托管会话终端页:xterm.js(经 jsdelivr CDN,不可达时降级为简易行输入模式)
+_TERMINAL_TPL = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__SID__ · ai-session-share</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<style>__CSS__</style></head>
+<body style="overflow:hidden">
+<div style="position:fixed;top:0;left:0;right:0;height:36px;background:#161b22;border-bottom:1px solid #30363d;
+display:flex;justify-content:space-between;align-items:center;padding:0 14px;z-index:9">
+  <div style="font:12px ui-monospace,Menlo,monospace;color:#79c0ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">__CMD__</div>
+  <div style="font:12px -apple-system,sans-serif"><span id="status" style="color:#3fb950">● 连接中…</span>
+  &nbsp;<a href="/" style="color:#58a6ff">面板</a></div>
+</div>
+<div id="term" style="position:fixed;top:36px;left:0;right:0;bottom:0"></div>
+<div id="fallback" style="display:none;position:fixed;top:36px;left:0;right:0;bottom:0;overflow:auto;padding:8px">
+  <div style="color:#d29922;font:12px sans-serif;padding:4px">xterm.js 加载失败(CDN 不可达),已降级为简易模式:仅支持整行回车发送。</div>
+  <pre id="flog" style="white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;color:#c9d1d9"></pre>
+  <input id="fin" style="position:fixed;bottom:0;left:0;width:100%;background:#161b22;border:none;
+border-top:1px solid #30363d;color:#c9d1d9;padding:8px;font:12px ui-monospace,monospace" placeholder="输入后回车发送">
+</div>
+<script>
+const SID = "__SID__";
+function setStatus(t, c){ const e=document.getElementById('status'); e.textContent=t; e.style.color=c; }
+let ws=null, term=null;
+const enc = new TextEncoder(); const dec = new TextDecoder();
+function fb(t){ document.getElementById('flog').textContent += t; document.getElementById('fallback').scrollTop = 1e9; }
+async function boot(){
+  if (window.Terminal){
+    term = new Terminal({cursorBlink:true, fontSize:13, theme:{background:'#0d1117', cursor:'#c9d1d9'}});
+    term.open(document.getElementById('term'));
+  } else {
+    document.getElementById('fallback').style.display='block';
+    document.getElementById('term').style.display='none';
+    document.getElementById('fin').addEventListener('keydown', e=>{
+      if (e.key==='Enter' && ws && ws.readyState===1){
+        ws.send(document.getElementById('fin').value+'\n'); document.getElementById('fin').value='';
+      }
+    });
+  }
+  let t=null;
+  try { t = (await (await fetch('/api/ticket')).json()).t; } catch(e){}
+  const url = (location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws/' + SID + (t?('?t='+t):'');
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setStatus('● 运行中', '#3fb950');
+    const cols = term ? term.cols : 80, rows = term ? term.rows : 24;
+    ws.send(enc.encode(JSON.stringify({type:'init', cols:cols, rows:rows})));
+  };
+  ws.onmessage = e => {
+    if (typeof e.data === 'string'){
+      try { const c = JSON.parse(e.data);
+        if (c.type==='ended'){ setStatus('■ 已结束(进程退出)', '#484f58'); document.title='已结束 · '+SID; }
+      } catch(_){}
+    } else {
+      const u = new Uint8Array(e.data);
+      if (term) term.write(dec.decode(u, {stream:true})); else fb(dec.decode(u, {stream:true}));
+    }
+  };
+  ws.onclose = () => setStatus('■ 连接已关闭', '#484f58');
+  ws.onerror = () => setStatus('■ 连接错误', '#f85149');
+  if (term){
+    term.onData(d => { if (ws && ws.readyState===1) ws.send(d); });
+    term.onResize(({cols, rows}) => { if (ws && ws.readyState===1)
+      ws.send(enc.encode(JSON.stringify({type:'resize', cols:cols, rows:rows}))); });
+  }
+}
+boot();
+</script></body></html>"""
+
+
+def terminal_page(sid, sess):
+    return (_TERMINAL_TPL
+            .replace("__CSS__", CSS)
+            .replace("__SID__", html.escape(sid, quote=True))
+            .replace("__CMD__", html.escape(" ".join(sess.argv), quote=True)))
+
+
+def ended_page(sid):
+    body = f"""
+<h1>■ 会话已结束</h1>
+<div class="sub">托管会话 <span class="mono">{_esc(sid)}</span> 已结束 —— 进程退出(如会话内 /exit)后
+网页会话自动停止,无需手动关闭。<br>返回 <a href="/">会话监控面板</a> 可查看或新建其他会话。</div>"""
+    return page("会话已结束", body)
+
+
 # ---------------------------------------------------------------- HTTP 服务
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -473,9 +919,16 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- GET --
     def do_GET(self):
+        raw = self.path
+        path = raw.split("?", 1)[0].rstrip("/") or "/"
+
+        # /ws/<id>?t=…:WebSocket 升级(浏览器 WS 无法携带 Basic Auth,用一次性票据)
+        m = re.fullmatch(r"/ws/([A-Za-z0-9_-]+)", path)
+        if m:
+            return self.handle_ws(m.group(1), raw)
+
         if not self.authorized():
             return self.deny()
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
 
         if path in ("/", "/index.html"):
             return self.reply(200, hub_page())
@@ -487,7 +940,59 @@ class Handler(BaseHTTPRequestHandler):
                 "tmux": tmux_sessions(),
                 "claude": claude_sessions(),
                 "atomcode": atomcode_sessions(),
+                "managed": MANAGED.list(),
+                "presets": [c for c in ("bash", "zsh", "claude", "atomcode", "codex")
+                            if shutil.which(c)],
             })
+
+        if path == "/api/ticket":
+            now = time.time()
+            for k in [k for k, v in TICKETS.items() if now - v > 60]:
+                del TICKETS[k]
+            t = secrets.token_hex(16)
+            TICKETS[t] = now
+            return self.reply_json({"t": t})
+
+        # 单个托管会话状态(含最近输出预览)
+        m = re.fullmatch(r"/api/session/([A-Za-z0-9_-]+)", path)
+        if m:
+            sess = MANAGED.get(m.group(1))
+            if not sess:
+                return self.reply_json({"ok": False, "error": "会话不存在或已清理"}, 404)
+            info = sess.info()
+            info["ok"] = True
+            preview = sess.tail(2048).decode("utf-8", "replace")
+            info["output_preview"] = preview
+            info["output_b64"] = base64.b64encode(sess.tail(65536)).decode()
+            return self.reply_json(info)
+
+        # 托管会话最近输出(?tail=字节数,默认 4096)
+        m = re.fullmatch(r"/api/output/([A-Za-z0-9_-]+)", path)
+        if m:
+            sess = MANAGED.get(m.group(1))
+            if not sess:
+                return self.reply_json({"ok": False, "error": "会话不存在或已清理"}, 404)
+            qs = urllib.parse.parse_qs(raw.split("?", 1)[1]) if "?" in raw else {}
+            try:
+                n = min(max(int(qs.get("tail", ["4096"])[0]), 1), 262144)
+            except (TypeError, ValueError):
+                n = 4096
+            data = sess.tail(n)
+            return self.reply_json({
+                "ok": True,
+                "id": sess.id,
+                "exited": sess.exited is not None,
+                "len": len(data),
+                "text": data.decode("utf-8", "replace"),
+            })
+
+        # /w/<id>:托管会话网页终端
+        m = re.fullmatch(r"/w/([A-Za-z0-9_-]+)", path)
+        if m:
+            sess = MANAGED.get(m.group(1))
+            if not sess or sess.exited is not None:
+                return self.reply(200, ended_page(m.group(1)))
+            return self.reply(200, terminal_page(sess.id, sess))
 
         # /open/<port> → 跳到对应 ttyd(带凭据的一键登录)
         m = re.fullmatch(r"/open/(\d+)", path)
@@ -536,11 +1041,119 @@ class Handler(BaseHTTPRequestHandler):
 
         return self.reply(404, "404 Not Found", "text/plain; charset=utf-8")
 
-    # -- POST:/api/share/<tmux会话名> --
+    # -- WebSocket:/ws/<id> --
+    def handle_ws(self, sid, raw):
+        if pty is None:
+            return self.reply(501, "501 当前平台不支持 pty,无托管会话功能", "text/plain; charset=utf-8")
+        # 认证:一次性票据(浏览器)或 Basic Auth(attach 本机客户端)
+        ok = False
+        qs = urllib.parse.parse_qs(raw.split("?", 1)[1]) if "?" in raw else {}
+        t = qs.get("t", [""])[0]
+        if t and t in TICKETS and time.time() - TICKETS.pop(t, 0) < 60:
+            ok = True
+        elif self.authorized():
+            ok = True
+        if not ok:
+            return self.deny()
+        sess = MANAGED.get(sid)
+        if not sess:
+            return self.reply(404, "404 会话不存在或已结束", "text/plain; charset=utf-8")
+        if sess.exited is not None:
+            return self.reply(410, "410 会话已结束(进程退出后会话自动停止)", "text/plain; charset=utf-8")
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            return self.reply(400, "400 缺少 Sec-WebSocket-Key", "text/plain; charset=utf-8")
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+
+        ws = WSConn(self.connection, self.rfile)
+        sess.add_conn(ws)
+        try:
+            while True:
+                fr = ws.recv()
+                if fr is None:
+                    break
+                op, data = fr
+                if op == 0x1:            # 文本帧 = 键盘输入 → 直通 PTY(UTF-8 透传)
+                    sess.write(data)
+                elif op == 0x2:          # 二进制帧 = 控制 JSON(init/resize)
+                    try:
+                        ctl = json.loads(data.decode("utf-8", "replace"))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if ctl.get("type") in ("init", "resize"):
+                        try:
+                            sess.set_winsize(int(ctl.get("cols", 80)), int(ctl.get("rows", 24)))
+                        except (TypeError, ValueError):
+                            pass
+        finally:
+            sess.remove_conn(ws)
+
+    # -- POST:/api/share/<tmux名> | /api/new | /api/kill/<id> --
     def do_POST(self):
+        # 防 CSRF:跨站请求无法携带自定义头
+        if self.headers.get("X-Share-API") != "1":
+            return self.reply_json({"ok": False, "error": "缺少 X-Share-API 头(防跨站请求)"}, 403)
         if not self.authorized():
             return self.deny()
-        m = re.fullmatch(r"/api/share/([A-Za-z0-9_-]+)", self.path.split("?", 1)[0])
+        path = self.path.split("?", 1)[0].rstrip("/")
+
+        if path == "/api/new":
+            try:
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8", "replace")
+                body = json.loads(raw or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self.reply_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+            argv = body.get("argv")
+            if not argv and isinstance(body.get("cmd"), str) and body["cmd"].strip():
+                argv = [body["cmd"].strip()]
+            if (not isinstance(argv, list) or not (1 <= len(argv) <= 32)
+                    or not all(isinstance(a, str) and a and len(a) <= 256 for a in argv)):
+                return self.reply_json({"ok": False, "error": "argv 不合法"}, 400)
+            if shutil.which(argv[0]) is None:
+                return self.reply_json({"ok": False, "error": f"命令不存在: {argv[0]}"}, 400)
+            if MANAGED.running_count() >= MAX_MANAGED:
+                return self.reply_json({"ok": False, "error": f"托管会话已达上限({MAX_MANAGED})"}, 429)
+            cwd = body.get("cwd") or str(HOME)
+            if not isinstance(cwd, str) or not os.path.isdir(cwd):
+                cwd = str(HOME)
+            try:
+                sess = MANAGED.spawn(argv, cwd)
+            except (RuntimeError, OSError) as e:
+                return self.reply_json({"ok": False, "error": str(e)}, 500)
+            return self.reply_json({"ok": True, "id": sess.id, "url": f"/w/{sess.id}"})
+
+        m = re.fullmatch(r"/api/kill/([A-Za-z0-9_-]+)", path)
+        if m:
+            sess = MANAGED.get(m.group(1))
+            if not sess or sess.exited is not None:
+                return self.reply_json({"ok": False, "error": "会话不存在或已结束"}, 404)
+            sess.terminate()   # 进程组 TERM→KILL 升级,交互式 bash 也能杀干净
+            return self.reply_json({"ok": True, "exited": sess.exited is not None})
+
+        # 向托管会话发送键盘输入(MCP/程序化操作入口;与网页输入同一条 PTY 通路)
+        m = re.fullmatch(r"/api/send/([A-Za-z0-9_-]+)", path)
+        if m:
+            sess = MANAGED.get(m.group(1))
+            if not sess or sess.exited is not None:
+                return self.reply_json({"ok": False, "error": "会话不存在或已结束"}, 404)
+            try:
+                raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8", "replace")
+                body = json.loads(raw_body or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return self.reply_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+            text = body.get("text")
+            if not isinstance(text, str) or not (1 <= len(text) <= 4096):
+                return self.reply_json({"ok": False, "error": "text 不合法(1-4096 字符)"}, 400)
+            sess.write(text.encode())
+            return self.reply_json({"ok": True, "id": sess.id})
+
+        m = re.fullmatch(r"/api/share/([A-Za-z0-9_-]+)", path)
         if not m:
             return self.reply_json({"ok": False, "error": "路径不合法"}, 404)
         name = m.group(1)
@@ -556,14 +1169,211 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply_json({"ok": False, "error": str(e)}, 500)
 
 
-def main():
-    srv = ThreadingHTTPServer(("0.0.0.0", HUB_PORT), Handler)
-    print(f"[hub] 会话监控面板已启动: http://0.0.0.0:{HUB_PORT} (认证已{'关闭' if NO_AUTH else '开启'})", flush=True)
+def _api_call(port, token, method, path, body=None):
+    """api_cli 共用的 HTTP 调用:返回 dict 或(失败时)错误文本。"""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=body.encode() if body is not None else None, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Share-API", "1")
+    if token:
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{AUTH_USER}:{token}".encode()).decode())
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+    except OSError as e:
+        return f"请求失败: {e}"
+
+
+def api_cli():
+    """命令行 API 客户端(share.sh 调用):读 hub.state 或 SS_HUB_URL,带 Basic Auth 与防 CSRF 头。
+
+    用法:
+      hub_server.py api new <cwd> <argv...>   新建托管会话,输出 JSON
+      hub_server.py api kill <id>             结束托管会话,输出 JSON
+      hub_server.py api send <id> <text>      向托管会话发送输入,输出 JSON
+      hub_server.py api output <id> [tail]    读托管会话最近输出,输出 JSON
+      hub_server.py api session <id>          托管会话详情,输出 JSON
+      hub_server.py api state                 面板状态,输出 JSON
+      hub_server.py api sessions              活动会话一览(文本,share.sh sessions 用)
+    """
+    args = sys.argv[2:]
+    if len(args) < 1:
+        print("用法: hub_server.py api new <cwd> <argv...> | api kill <id> | api state", file=sys.stderr)
+        return 2
+    cfg = {}
+    try:
+        for line in (STATE_DIR / "hub.state").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k] = v
+    except OSError:
+        pass
+    port, token = cfg.get("port", ""), cfg.get("token", "")
+    if not port or not token:
+        # 兜底:SS_HUB_URL / SS_HUB_TOKEN 环境变量(免状态文件的全局发现)
+        hub_url = os.environ.get("SS_HUB_URL", "").rstrip("/")
+        if not port and hub_url and ":" in hub_url:
+            port = hub_url.rsplit(":", 1)[1]
+        if not token:
+            token = os.environ.get("SS_HUB_TOKEN", "")
+    if not port:
+        print(f"读取 {STATE_DIR / 'hub.state'} 失败(面板未启动?先 share hub start)", file=sys.stderr)
+        return 1
+
+    if args[0] == "new":
+        if len(args) < 3:
+            print("用法: api new <cwd> <argv...>", file=sys.stderr)
+            return 2
+        method, path, body = "POST", "/api/new", json.dumps({"argv": args[2:], "cwd": args[1]})
+    elif args[0] == "kill":
+        if len(args) != 2:
+            print("用法: api kill <id>", file=sys.stderr)
+            return 2
+        method, path, body = "POST", "/api/kill/" + args[1], None
+    elif args[0] == "send":
+        if len(args) != 3:
+            print("用法: api send <id> <text>", file=sys.stderr)
+            return 2
+        method, path, body = "POST", "/api/send/" + args[1], json.dumps({"text": args[2]})
+    elif args[0] == "output":
+        if len(args) < 2:
+            print("用法: api output <id> [tail字节]", file=sys.stderr)
+            return 2
+        tail = args[2] if len(args) > 2 else "4096"
+        method, path, body = "GET", f"/api/output/{args[1]}?tail={tail}", None
+    elif args[0] == "session":
+        if len(args) != 2:
+            print("用法: api session <id>", file=sys.stderr)
+            return 2
+        method, path, body = "GET", "/api/session/" + args[1], None
+    elif args[0] == "state":
+        method, path, body = "GET", "/api/state", None
+    elif args[0] == "sessions":
+        # 全局活动会话一览(文本表格,share.sh sessions 调用)
+        d = _api_call(port, token, "GET", "/api/state")
+        if not isinstance(d, dict):
+            print(d, file=sys.stderr)
+            return 1
+        base = f"http://127.0.0.1:{port}"
+        print("═══ ai-session-share 活动会话 ═══")
+        mg = [x for x in d.get("managed", []) if not x.get("exited")]
+        ended = [x for x in d.get("managed", []) if x.get("exited")]
+        if mg:
+            print("托管会话(免 tmux,进程退出自动结束):")
+            for x in mg:
+                print(f"  {x['id']}  ● 运行中  客户端 {x['clients']}  {x['cmd']}")
+                print(f"    网页: {base}/w/{x['id']}   本机: share attach {x['id']}   结束: share kill {x['id']}")
+        if ended:
+            print(f"托管会话(已结束,面板仍可查看): {len(ended)} 个")
+        if not mg and not ended:
+            print("托管会话: 无(可 share new claude 创建)")
+        for x in d.get("shared", []):
+            print(f"共享终端: {x['session']}  端口 {x['port']}")
+        cl = d.get("claude", [])
+        if cl:
+            live = [x for x in cl if x.get("live")]
+            print(f"Claude Code 会话: {len(cl)} 个(活跃 {len(live)}),实时视图: {base}/t/<会话id>")
+        at = d.get("atomcode", [])
+        if at:
+            print(f"atomcode 活动: {len(at)} 个项目")
+        print()
+        print(f"面板: {base}/    全局环境变量: SS_HUB_URL=http://127.0.0.1:{port}")
+        return 0
+    else:
+        print("未知 api 子命令: " + args[0], file=sys.stderr)
+        return 2
+
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=body.encode() if body is not None else None, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Share-API", "1")
+    if token:
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{AUTH_USER}:{token}".encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            print(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(e.read().decode(), file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"请求失败: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _daemonize():
+    """双 fork + setsid 脱离调用者的会话/进程组:
+    终端关闭、父进程组被清理都不会波及面板(与 tmux/ttyd 常驻同理)。
+    stdio 重定向: stdin=/dev/null, stdout/stderr=hub.log(追加)。"""
+    log_path = STATE_DIR / "hub.log"
+    try:
+        pid = os.fork()
+        if pid > 0:
+            os._exit(0)              # 第一父进程立即退出,启动方轮询 hub.pid 即可
+        os.setsid()                  # 脱离原会话,成为新会话首进程
+        pid2 = os.fork()
+        if pid2 > 0:
+            os._exit(0)              # 会话首进程退出,最终进程不再持有控制终端
+    except OSError:
+        return                       # fork 失败则退化为前台运行
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.close(0)
+        os.open(os.devnull, os.O_RDONLY)     # fd0 = /dev/null
+        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        if fd > 2:
+            os.close(fd)
+    except OSError:
         pass
 
 
+def main():
+    global TOKEN
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        return api_cli()
+
+    if pty is None:
+        print("[hub] 警告: 当前平台无 pty,托管会话功能不可用(仅监控)", file=sys.stderr)
+    if not TOKEN and not NO_AUTH:
+        TOKEN = secrets.token_hex(16)
+
+    if os.environ.get("SS_HUB_DAEMON") == "1":
+        _daemonize()                 # 先守护化(脱离进程组),再绑定端口/写状态
+
+    srv = ThreadingHTTPServer(("0.0.0.0", HUB_PORT), Handler)
+
+    # 状态文件由最终进程自己写(pid 才是真实的守护进程 pid);绑定成功后才写
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (STATE_DIR / "hub.state").write_text(
+            f"port={HUB_PORT}\ntoken={TOKEN}\npid={os.getpid()}\n"
+            f"started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        (STATE_DIR / "hub.pid").write_text(f"{os.getpid()}\n")
+    except OSError:
+        pass
+
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)   # 托管会话子进程自动回收,不产生僵尸
+
+    def _shutdown(_sig, _frm):
+        # 面板退出 = 托管会话宿主消失:一并结束所有托管会话
+        MANAGED.kill_all()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    print(f"[hub] 会话监控面板已启动: http://0.0.0.0:{HUB_PORT} pid={os.getpid()} "
+          f"(认证已{'关闭' if NO_AUTH else '开启'})", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        MANAGED.kill_all()
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

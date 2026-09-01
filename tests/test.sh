@@ -37,7 +37,7 @@ cleanup() {
     "$SHARE" stop idemtest >/dev/null 2>&1
     "$SHARE" stop autoport >/dev/null 2>&1
     "$SHARE" stop busyx >/dev/null 2>&1
-    SS_HUB_PORT="$HUB_PORT" "$SHARE" hub stop >/dev/null 2>&1
+    SS_HUB_PORT="$HUB_PORT" SS_FORCE=1 "$SHARE" hub stop >/dev/null 2>&1
     tmux kill-session -t "$SESSION" >/dev/null 2>&1
     tmux kill-session -t herex >/dev/null 2>&1
     tmux kill-session -t hereauto >/dev/null 2>&1
@@ -384,6 +384,332 @@ if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub status | grep -q "未运行"; then
 else
     bad "hub status 仍显示运行"
 fi
+
+# --- 20. 托管会话(自管 PTY,不依赖 tmux) ---
+say "托管会话(免 tmux,生命周期绑定)"
+if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub start >/dev/null 2>&1; then
+    ok "hub 重启成功(承载托管会话)"
+else
+    bad "hub 重启失败"
+fi
+sleep 1
+PROBE="$REPO/tests/hub_ws_probe.py"
+HUB_TOKEN="$(grep '^token=' "${STATE_DIR}/hub.state" 2>/dev/null | cut -d= -f2)"
+MGMT_SID="$(python3 "$PROBE" new --cmd "bash -c 'echo MGMT_HELLO_WORLD; sleep 60'" 2>/dev/null)"
+if [[ "$MGMT_SID" == m* ]]; then
+    ok "托管会话已创建 (id=${MGMT_SID})"
+else
+    bad "托管会话创建失败: ${MGMT_SID}"
+fi
+code_w="$(curl -s -o /dev/null -w '%{http_code}' -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/w/${MGMT_SID}" 2>/dev/null || echo 000)"
+if [[ "$code_w" == "200" ]]; then
+    ok "托管会话网页终端页 200"
+else
+    bad "托管会话终端页应 200,实际 ${code_w}"
+fi
+if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/state" | grep -q "\"${MGMT_SID}\""; then
+    ok "面板列出托管会话"
+else
+    bad "面板未列出托管会话"
+fi
+if python3 "$PROBE" read --id "$MGMT_SID" --until MGMT_HELLO_WORLD --timeout 10 2>/dev/null; then
+    ok "PTY 输出经 WebSocket 到达(含历史回放)"
+else
+    bad "WebSocket 未收到会话输出"
+fi
+
+# --- 21. WS 输入 → PTY 执行(双向,用交互式 bash) ---
+MARKM="${TMPDIR:-/tmp}/ai-session-share-mgmt.mark"
+rm -f "$MARKM"
+IN_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+if [[ "$IN_SID" == m* ]] \
+    && python3 "$PROBE" write --id "$IN_SID" --text "echo MGMT_INPUT_OK > $MARKM"$'\n' 2>/dev/null; then
+    sleep 1
+    if [[ -f "$MARKM" ]] && grep -q MGMT_INPUT_OK "$MARKM"; then
+        ok "浏览器输入到达 PTY 并执行(双向)"
+    else
+        bad "浏览器输入未在会话内执行"
+    fi
+else
+    bad "WebSocket 写入失败"
+fi
+rm -f "$MARKM"
+python3 "$REPO/hub_server.py" api kill "$IN_SID" >/dev/null 2>&1 || true
+
+# --- 22. 进程退出 → 会话自动结束(核心生命周期) ---
+say "托管会话生命周期(进程退出自动结束)"
+EXIT_SID="$(python3 "$PROBE" new --cmd "bash -c 'echo BYE; exit 0'" 2>/dev/null)"
+if python3 "$PROBE" ended --id "$EXIT_SID" --timeout 10 2>/dev/null; then
+    ok "进程退出后会话自动结束"
+else
+    bad "会话未随进程退出而结束"
+fi
+sleep 0.5
+if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/w/${EXIT_SID}" | grep -q "已结束"; then
+    ok "结束后页面显示'会话已结束'"
+else
+    bad "结束后页面未提示已结束"
+fi
+
+# --- 23. share attach 本机连接 ---
+say "share attach 本机连接"
+ATT_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+ATT_MARK="${TMPDIR:-/tmp}/ai-session-share-attach.mark"
+rm -f "$ATT_MARK"
+python3 - "$ATT_SID" "$ATT_MARK" <<'PYEOF' 2>/dev/null
+import os, pty, sys, time
+sid, mark = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("python3", ["python3", "hub_attach.py", sid])
+else:
+    time.sleep(1.5)
+    try:
+        os.write(fd, b"echo ATTACH_OK > " + mark.encode() + b"\n")
+    except OSError:
+        pass
+    for _ in range(40):
+        time.sleep(0.25)
+        if os.path.exists(mark):
+            break
+    try:
+        os.write(fd, b"exit\n")   # 结束会话,attach 应自动退出
+    except OSError:
+        pass
+    for _ in range(20):
+        if os.waitpid(pid, os.WNOHANG)[0] != 0:
+            break
+        time.sleep(0.25)
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+PYEOF
+if [[ -f "$ATT_MARK" ]]; then
+    ok "attach 输入直达会话(本机直通)"
+else
+    bad "attach 连接失败"
+fi
+rm -f "$ATT_MARK"
+python3 "$REPO/hub_server.py" api kill "$ATT_SID" >/dev/null 2>&1 || true
+python3 "$REPO/hub_server.py" api kill "$MGMT_SID" >/dev/null 2>&1 || true
+
+# --- 24. hook 托管会话分支 ---
+say "hook 托管会话分支"
+HOOK_M="$(printf '{"prompt":"/share_session"}' | SS_MANAGED_ID="testmid01" SS_HUB_PORT="$HUB_PORT" SS_STATE_DIR="$STATE_DIR" python3 "$REPO/hooks/share_session_hook.py" 2>/dev/null)"
+if echo "$HOOK_M" | grep -q "/w/testmid01"; then
+    ok "hook 输出托管会话链接 (/w/testmid01)"
+else
+    bad "hook 未输出托管链接: $(echo "$HOOK_M" | head -c 200)"
+fi
+if echo "$HOOK_M" | grep -q "生命周期"; then
+    ok "hook 说明生命周期绑定"
+else
+    bad "hook 缺生命周期说明"
+fi
+
+# --- 25. API 防 CSRF ---
+say "API 防 CSRF"
+code_csrf="$(curl -s -o /dev/null -w '%{http_code}' -X POST -u "ai:${HUB_TOKEN}" -H 'Content-Type: application/json' -d '{"cmd":"bash"}' "http://127.0.0.1:${HUB_PORT}/api/new" 2>/dev/null || echo 000)"
+if [[ "$code_csrf" == "403" ]]; then
+    ok "缺 X-Share-API 头的 POST 被拒 (403)"
+else
+    bad "缺防 CSRF 头应 403,实际 ${code_csrf}"
+fi
+
+# --- 26. hub stop 保护(有托管会话时拒绝) ---
+say "hub stop 保护"
+PROTECT_SID="$(python3 "$PROBE" new --cmd "sleep 60" 2>/dev/null)"
+if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub stop >/dev/null 2>&1; then
+    bad "有存活托管会话时 hub stop 应拒绝"
+else
+    ok "有存活托管会话时 hub stop 被拒绝(SS_FORCE=1 可强制)"
+fi
+SS_HUB_PORT="$HUB_PORT" SS_FORCE=1 "$SHARE" hub stop >/dev/null 2>&1
+sleep 0.5
+if ! kill -0 "$(pgrep -f "hub_server.py" | head -1)" 2>/dev/null || ! pgrep -f "hub_server.py" >/dev/null 2>&1; then
+    ok "SS_FORCE=1 强制停止成功"
+else
+    # 可能有真实面板在 7690(非测试端口),只确认测试端口已停
+    if ! curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${HUB_PORT}/" 2>/dev/null; then
+        ok "SS_FORCE=1 强制停止成功(测试端口已关闭)"
+    else
+        bad "强制停止失败"
+    fi
+fi
+
+# --- 27. hub send/output/session 程序化 API ---
+say "hub 程序化 API(send/output/session)"
+# 26 的强制停止测试后需要重新拉起面板,后续 API/MCP/全局发现测试都依赖它
+if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub start >/dev/null 2>&1; then
+    ok "hub 重启成功(承载程序化 API/MCP)"
+else
+    bad "hub 重启失败"
+fi
+sleep 1
+HUB_TOKEN="$(grep '^token=' "${STATE_DIR}/hub.state" 2>/dev/null | cut -d= -f2)"
+API_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+if [[ "$API_SID" == m* ]]; then
+    sleep 0.5
+    curl -s -u "ai:${HUB_TOKEN}" -X POST -H 'Content-Type: application/json' -H 'X-Share-API: 1' \
+        -d "{\"text\":\"echo API_EP_OK$RANDOM\\n\"}" "http://127.0.0.1:${HUB_PORT}/api/send/${API_SID}" >/dev/null
+    sleep 0.8
+    if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/output/${API_SID}?tail=4096" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["ok"] and "API_EP_OK" in d["text"] else 1)' 2>/dev/null; then
+        ok "/api/send → /api/output 往返一致"
+    else
+        bad "/api/send 或 /api/output 异常"
+    fi
+    if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/session/${API_SID}" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["ok"] and "output_preview" in d else 1)' 2>/dev/null; then
+        ok "/api/session 详情(含输出预览)"
+    else
+        bad "/api/session 异常"
+    fi
+else
+    bad "API 测试会话创建失败"
+fi
+python3 "$REPO/hub_server.py" api kill "$API_SID" >/dev/null 2>&1 || true
+
+# --- 28. 交互式 bash 的 kill 升级(TERM 忽略 → KILL 兜底) ---
+say "kill 对交互式 bash 的升级"
+KILLB_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+sleep 0.3
+if python3 "$REPO/hub_server.py" api kill "$KILLB_SID" 2>/dev/null \
+    | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("exited") else 1)' 2>/dev/null; then
+    ok "交互式 bash 被可靠结束(进程组 TERM→KILL)"
+else
+    bad "交互式 bash 未被结束(SIGTERM 被忽略?)"
+fi
+
+# --- 29. MCP 服务器(piped JSON-RPC 全六工具) ---
+say "MCP 服务器 roundtrip"
+MCP_OUT="$(python3 - <<'PYEOF'
+import json, subprocess, time
+
+def rpc(msgs):
+    stdin = "\n".join(json.dumps(m) for m in msgs) + "\n"
+    r = subprocess.run(["python3", "mcp_server.py"], input=stdin,
+                       capture_output=True, text=True, timeout=60)
+    return [json.loads(l) for l in r.stdout.strip().splitlines()]
+
+fails = []
+rs = rpc([
+    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+    {"jsonrpc":"2.0","id":2,"method":"tools/list"},
+])
+if rs[0]["result"]["serverInfo"]["name"] != "ai-session-share":
+    fails.append("initialize")
+tools = [t["name"] for t in rs[1]["result"]["tools"]]
+if tools != ["list_sessions","session_status","spawn_session","send_input","read_output","kill_session"]:
+    fails.append("tools/list: " + ",".join(tools))
+
+r = rpc([{"jsonrpc":"2.0","id":3,"method":"tools/call",
+          "params":{"name":"spawn_session","arguments":{"command":"bash","cwd":"/tmp"}}}])
+text = r[0]["result"]["content"][0]["text"]
+if "托管会话已创建" not in text:
+    fails.append("spawn: " + text[:80])
+sid = text.split("托管会话已创建: ")[1].split("\n")[0]
+
+time.sleep(0.6)
+r = rpc([{"jsonrpc":"2.0","id":4,"method":"tools/call",
+          "params":{"name":"send_input","arguments":{"session_id":sid,"text":"echo MCP_T_OK\r"}}}])
+time.sleep(0.8)
+r = rpc([{"jsonrpc":"2.0","id":5,"method":"tools/call",
+          "params":{"name":"read_output","arguments":{"session_id":sid}}}])
+if "MCP_T_OK" not in r[0]["result"]["content"][0]["text"]:
+    fails.append("send/read roundtrip")
+
+r = rpc([{"jsonrpc":"2.0","id":6,"method":"tools/call",
+          "params":{"name":"session_status","arguments":{"session_id":sid}}}])
+if json.loads(r[0]["result"]["content"][0]["text"])["state"] != "运行中":
+    fails.append("session_status")
+
+r = rpc([{"jsonrpc":"2.0","id":7,"method":"tools/call",
+          "params":{"name":"list_sessions","arguments":{}}}])
+if sid not in r[0]["result"]["content"][0]["text"]:
+    fails.append("list_sessions")
+
+r = rpc([{"jsonrpc":"2.0","id":8,"method":"tools/call",
+          "params":{"name":"kill_session","arguments":{"session_id":sid}}}])
+if "已请求结束" not in r[0]["result"]["content"][0]["text"]:
+    fails.append("kill_session")
+time.sleep(0.4)
+r = rpc([{"jsonrpc":"2.0","id":9,"method":"tools/call",
+          "params":{"name":"session_status","arguments":{"session_id":sid}}}])
+if json.loads(r[0]["result"]["content"][0]["text"])["state"] != "已结束":
+    fails.append("kill 后状态")
+
+r = rpc([{"jsonrpc":"2.0","id":10,"method":"tools/call",
+          "params":{"name":"nope","arguments":{}}}])
+if r[0].get("error", {}).get("code") != -32602:
+    fails.append("未知工具错误码")
+
+r = rpc([{"jsonrpc":"2.0","id":11,"method":"tools/call",
+          "params":{"name":"session_status","arguments":{"session_id":"nonexistent99"}}}])
+if not r[0]["result"].get("isError"):
+    fails.append("不存在会话应 isError")
+
+print("FAIL:" + ";".join(fails) if fails else "MCP_ALL_OK")
+PYEOF
+)" 2>/dev/null
+if [[ "$MCP_OUT" == "MCP_ALL_OK" ]]; then
+    ok "MCP 六工具 roundtrip + 错误路径全过"
+else
+    bad "MCP 测试失败: ${MCP_OUT:-无输出}"
+fi
+
+# --- 30. 全局发现:share sessions / SS_HUB_URL / 注册器幂等 ---
+say "全局发现与注册"
+if SS_HUB_PORT="$HUB_PORT" "$SHARE" sessions 2>/dev/null | grep -q "ai-session-share 活动会话"; then
+    ok "share sessions 全局视图输出正常"
+else
+    bad "share sessions 输出异常"
+fi
+# SS_HUB_URL/SS_HUB_TOKEN 兜底:清掉 hub.state 模拟"仅靠环境变量发现"
+mv "${STATE_DIR}/hub.state" "${STATE_DIR}/hub.state.bak"
+if SS_HUB_URL="http://127.0.0.1:${HUB_PORT}" SS_HUB_TOKEN="${HUB_TOKEN}" \
+    python3 "$REPO/hub_server.py" api sessions 2>/dev/null | grep -q "活动会话"; then
+    ok "SS_HUB_URL+SS_HUB_TOKEN 兜底发现 hub(无 hub.state 时)"
+else
+    bad "SS_HUB_URL 兜底失败"
+fi
+mv "${STATE_DIR}/hub.state.bak" "${STATE_DIR}/hub.state"
+# install_env_var 幂等(临时 rc)
+TMPRC="${TMPDIR:-/tmp}/ai-session-share-rc-test.txt"
+rm -f "$TMPRC"
+sed -n '/^install_env_var()/,/^}/p' "$REPO/install.sh" > "${TMPDIR:-/tmp}/ie.sh"
+(
+    REPO_DIR="$REPO"
+    log_ok() { :; }
+    export SS_RC_FILE="$TMPRC" SS_HUB_PORT="$HUB_PORT"
+    # shellcheck disable=SC1090
+    source "${TMPDIR:-/tmp}/ie.sh"
+    install_env_var
+    install_env_var
+) 
+if [[ "$(grep -c "export SS_HUB_URL=" "$TMPRC")" == "1" ]]; then
+    ok "install_env_var 幂等写入(仅 1 条)"
+else
+    bad "install_env_var 重复写入: $(grep -c 'export SS_HUB_URL=' "$TMPRC") 条"
+fi
+rm -f "$TMPRC" "${TMPDIR:-/tmp}/ie.sh"
+# mcp_register 幂等(假 HOME)
+FAKEH="${TMPDIR:-/tmp}/ai-session-share-fake-home"
+mkdir -p "$FAKEH/bin"
+for c in claude atomcode codex; do
+    printf '#!/bin/sh\nexit 0\n' > "$FAKEH/bin/$c"
+    chmod +x "$FAKEH/bin/$c"
+done
+PATH="$FAKEH/bin:$PATH" python3 "$REPO/mcp_register.py" --home "$FAKEH" >/dev/null 2>&1
+PATH="$FAKEH/bin:$PATH" python3 "$REPO/mcp_register.py" --home "$FAKEH" >/dev/null 2>&1
+TOML_N="$(grep -c "mcp_servers.ai-session-share" "$FAKEH/.codex/config.toml" 2>/dev/null || echo 0)"
+if [[ "$TOML_N" == "1" ]] && python3 -c "import json,sys; json.load(open('$FAKEH/.claude.json'))" 2>/dev/null; then
+    ok "mcp_register 三客户端幂等注册(JSON 合法/TOML 不重复)"
+else
+    bad "mcp_register 幂等失败(TOML 段数: ${TOML_N})"
+fi
+rm -rf "$FAKEH"
 
 # --- 汇总 ---
 echo

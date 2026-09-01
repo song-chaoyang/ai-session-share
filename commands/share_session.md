@@ -19,6 +19,9 @@ share here || ~/.local/bin/share here
 share hub start || ~/.local/bin/share hub start
 ```
 
+说明:要浏览器能**双向操作**且生命周期随会话自动结束,用托管会话(免 tmux):退出本地 AI 工具后执行
+`share new claude --resume <会话id>`;或直接 `share new claude` 开新会话。会话内执行 `/exit` 或进程退出后,网页会话自动结束。
+
 需要展示给用户的信息(来自命令输出):
 
 1. 局域网访问链接(输出里的每一行 `http://IP:端口`);

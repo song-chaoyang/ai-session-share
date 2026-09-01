@@ -125,6 +125,25 @@ def build_links() -> str:
     """按会话上下文生成输出文本(带 [share] 前缀,风格与 share.sh 一致)。"""
     lines = []
 
+    # 分支 0:当前 AI 工具就跑在本服务的托管会话里(hub 用 PTY 起的)
+    # → 链接即本会话的双向终端;生命周期与会话进程绑定(/exit → 网页自动结束)
+    managed = os.environ.get("SS_MANAGED_ID", "")
+    if managed:
+        hub = ensure_hub()
+        if hub:
+            ip = lan_ip()
+            port, token = hub["port"], hub.get("token", "")
+            view = f"http://{ip}:{port}/w/{managed}"
+            lines.append("[share] 当前会话已在托管终端中,链接即本会话(双向操作,生命周期与会话绑定):")
+            lines.append(f"[share]   局域网访问: {view}")
+            if token:
+                lines.append(f"[share]   浏览器登录: 用户名 ai，密码 {token}")
+                lines.append(f"[share]   一键登录: http://ai:{token}@{ip}:{port}/w/{managed}")
+            lines.append("[share]   说明: 在会话里执行 /exit 或进程退出后,网页会话自动结束,无需 stop;")
+            lines.append(f"[share]   本机重新连接: share attach {managed}")
+            lines.append(f"[share]   会话监控面板(所有会话): http://{ip}:{port}/")
+            return "\n".join(lines)
+
     # 分支 1:在 tmux 会话内 → 共享当前 tmux 会话(可双向操作)
     if os.environ.get("TMUX"):
         sh = share_sh_path()
@@ -134,7 +153,7 @@ def build_links() -> str:
         else:
             lines.append("[share] 执行 share here 失败,可手动运行: share here")
 
-    # 公共:确保监控面板在运行(所有分支都需要它承载 /t/ 视图与面板)
+    # 公共:确保监控面板在运行(所有分支都需要它承载 /t/ /w/ 视图与面板)
     hub = ensure_hub()
 
     if not os.environ.get("TMUX"):
@@ -152,8 +171,8 @@ def build_links() -> str:
                 lines.append(f"[share]   浏览器登录: 用户名 ai，密码 {token}")
                 lines.append(f"[share]   一键登录: http://ai:{token}@{ip}:{port}/t/{sid}")
             lines.append("[share]   说明: 当前终端不在 tmux 内,网页是该会话的实时只读视图;")
-            lines.append("[share]         要浏览器能直接输入操作,请在 tmux 会话里运行 AI 工具:")
-            lines.append(f"[share]         share start  # 进入 tmux 后运行: claude --resume {sid}")
+            lines.append("[share]         要浏览器能直接输入操作,用托管会话(免 tmux,生命周期绑定):")
+            lines.append(f"[share]         退出本地会话后执行: share new claude --resume {sid}")
             lines.append(f"[share]   会话监控面板(所有会话): {base}/")
         elif hub:
             # 分支 3 兜底:面板首页

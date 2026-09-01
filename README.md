@@ -87,6 +87,7 @@ command in the AI tool's conversation:
 > returns the links via `{"decision":"block"}` — the LLM never participates (measured `total_tokens: 0`, `rounds: 0`).
 > The output is **session-aware** — it always corresponds to the session you invoked it from, never another one:
 >
+> - running in a **managed session** (`share new`) → link to that session's bidirectional terminal; ends with the process;
 > - running **inside tmux** → the link opens your current tmux session, **bidirectional** (watch and operate);
 > - running Claude in a **plain terminal** (no tmux) → the link opens the **live web view of that exact Claude session**
 >   (read-only, real-time refresh), plus a hint for getting a bidirectional terminal;
@@ -96,6 +97,7 @@ command in the AI tool's conversation:
 > 直接执行共享命令并把链接通过 `{"decision":"block"}` 原样返回给用户——LLM 完全不参与(实测 `total_tokens: 0` / `rounds: 0`),
 > 不消耗任何推理 token。输出是**会话感知**的——永远对应你调用它的那个会话,不会打印无关会话的链接:
 >
+> - 在**托管会话**(`share new`)内运行 → 输出该会话的双向终端链接,随进程结束而结束;
 > - 在 **tmux 会话内**运行 → 链接打开的就是当前 tmux 会话,**双向可操作**;
 > - 在**普通终端**(未用 tmux)运行 Claude → 链接打开的是**这个 Claude 会话的实时网页视图**(只读、实时刷新),
 >   并附上如何获得双向终端的提示;
@@ -116,6 +118,70 @@ command in the AI tool's conversation:
 >
 > 浏览器打开即可继续操作**同一个**会话。停止共享用 `/share stop` 或 `share stop`。重新运行 `./install.sh -y`
 > 即可为后来安装的工具补装命令与 hook。若某工具未注册 hook(比如手动删除过配置),命令模板仍会提示 AI 直接执行并原样展示输出。
+
+---
+
+## Managed sessions — no tmux · 托管会话(免 tmux,生命周期绑定)
+
+`share new` runs a command (e.g. `claude`) in a **hub-managed PTY** — no tmux, no ttyd:
+
+`share new` 把命令(如 `claude`)跑在**面板自管的 PTY** 里——不需要 tmux、不需要 ttyd:
+
+```bash
+share new claude          # spawn Claude → attach locally → print LAN link
+                          # 启动 Claude → 本机进入 → 打印局域网链接
+share new --no-attach bash
+share attach <id>         # re-attach a local terminal (closing it does NOT end the session)
+                          # 本机终端再次连接(关闭终端不会结束会话)
+share kill <id>           # force-end · 强制结束
+```
+
+- The browser terminal (`/w/<id>`) is fully **bidirectional** — you and every viewer share one PTY;
+  late joiners see recent output (replay buffer) and resizing is propagated to the process.
+  网页终端(`/w/<id>`)完全**双向**——你与所有观看者共用同一个 PTY;晚打开的也能看到最近输出(回放缓存),窗口尺寸变化会同步给进程。
+- **Lifecycle is bound to the session**: when the process exits (e.g. you run `/exit` in Claude),
+  the web session ends **automatically** — no `stop` needed. Closing your local terminal does *not* end it.
+  **生命周期与会话绑定**:进程退出(如在 Claude 里执行 `/exit`)后网页会话**自动结束**,无需任何 `stop`;
+  关闭本机终端*不会*结束会话。
+- `/share_session` inside a managed session prints exactly that session's link.
+  在托管会话里执行 `/share_session`,输出的就是该会话的链接。
+
+`share hub stop` refuses while managed sessions are running (use `SS_FORCE=1` to override).
+还有托管会话在运行时 `share hub stop` 会拒绝执行(确认可用 `SS_FORCE=1`)。
+
+---
+
+## MCP server — operate sessions from any AI client · MCP 服务器(多 AI 客户端操作会话)
+
+`./install.sh -y` also registers an MCP server (`mcp_server.py`, stdlib-only stdio JSON-RPC) into every
+detected MCP-capable AI client (claude / atomcode / codex). Inside any of them you can now **view and operate
+every shared session directly from the conversation**:
+
+`./install.sh -y` 同时会把 MCP 服务器(`mcp_server.py`,纯标准库 stdio JSON-RPC)注册进检测到的每个支持 MCP
+的 AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在对话中查看与操作所有共享会话**:
+
+| Tool · 工具 | Effect · 作用 |
+|------|------|
+| `list_sessions` | List every active session with status (managed / ttyd / Claude / atomcode) · 列出所有活动会话与状态 |
+| `session_status` | One managed session's details: cmd / pid / clients / link / output preview · 单个托管会话详情(命令/PID/连接/链接/输出预览) |
+| `spawn_session` | Start a new managed session (e.g. `claude`) and get its web link · 新建托管会话并返回网页链接 |
+| `send_input` | Send keyboard input to a session — same PTY as the web page / `share attach` · 向会话发送键盘输入(与网页/本机同一条 PTY) |
+| `read_output` | Read a session's recent output (configurable tail) · 读取会话最近输出 |
+| `kill_session` | Force-end a session (process-group TERM→KILL) · 强制结束会话(进程组 TERM→KILL 升级) |
+
+Example — in any MCP client, just say: *"list my sessions"* → the AI calls `list_sessions`, then
+*"spawn a claude session"* → you get the URL, and *"send 'ls -la' to it"* → the input lands in the same
+terminal the browser shows. Sessions end automatically when their process exits.
+例如在任意 MCP 客户端里直接说:*"列出我的会话"* → AI 调 `list_sessions`;*"开一个 claude 会话"* → 返回链接;
+*"往里面输入 ls -la"* → 输入落在浏览器看到的同一个终端里。会话进程退出后自动结束。
+
+The dashboard endpoint is globally discoverable via the `SS_HUB_URL` environment variable
+(`./install.sh -y` adds it to your shell rc); `SS_HUB_TOKEN` provides the auth fallback.
+面板端点通过 `SS_HUB_URL` 环境变量全局可发现(`./install.sh -y` 自动写入 shell rc);`SS_HUB_TOKEN` 提供认证兜底。
+`share sessions` prints the same global view in the terminal.
+`share sessions` 在终端里输出同样的全局会话视图。
+
+---
 
 ---
 
@@ -153,17 +219,26 @@ The same Basic Auth (user `ai` + random token) protects the dashboard and its vi
 
 ┌─────────────────────────┐        ┌──────────────────┐
 │  会话监控面板(hub)        │        │  浏览器 Browser    │
-│  ├─ tmux 会话列表         │        │  仪表盘(5s 刷新)   │
+│  ├─ 托管会话(自管 PTY)────┼────────┤  xterm.js 终端     │
+│  │   进程退出→网页自动结束 │        │  (双向,免 tmux)    │
 │  ├─ Claude 会话 jsonl ────┼────────┤  实时会话视图(只读) │
-│  └─ atomcode 活动日志     │        │                  │
-└─────────────────────────┘        └──────────────────┘
-        ▲ hub (port 7690) monitors every running session · 面板监控所有运行中的会话
+│  ├─ tmux 会话/atomcode 活动│        │  仪表盘(5s 刷新)   │
+│  └─ ttyd 服务清单          │        └──────────────────┘
+└─────────────────────────┘
+        ▲ hub (port 7690) hosts managed PTYs & monitors every session
+        ▲ 面板承载托管 PTY(进程退出→网页自动结束)并监控所有运行中的会话
 ```
 
 - **tmux** holds the real session: you and every browser user attach to the *same* session, so context is naturally identical.
   **tmux** 持有真正的会话:你、浏览器用户都 attach 到同一个会话,上下文天然一致;
 - **ttyd** exposes that session as a WebSocket terminal (xterm.js); browsers need nothing installed.
   **ttyd** 把该会话暴露成 WebSocket 终端(xterm.js),浏览器无需装任何东西;
+- **managed sessions** (`share new`, hub-hosted PTY) are the tmux-free alternative: the hub itself forks the
+  command with a pty and serves xterm.js over its own WebSocket (stdlib-only implementation). Local users
+  `share attach`/close freely — only the process exiting (e.g. `/exit`) ends the session, which auto-ends the web view.
+  **托管会话**(`share new`,面板自管 PTY)是免 tmux 的替代方案:面板自己 fork 命令并持有 PTY,用自己的
+  WebSocket(纯标准库实现)提供 xterm.js 终端。本机可随时 `share attach`/关闭终端——只有进程退出
+  (如 `/exit`)才结束会话,网页视图随之自动结束。
 - **hub** (`hub_server.py`, stdlib-only) is the always-on dashboard: it monitors tmux sessions (with one-click
   "share this session" buttons), Claude Code sessions (rendered as live web views), atomcode activity, and all
   running ttyd services. `/share_session` in a plain-terminal Claude links straight into its live view.
@@ -195,6 +270,7 @@ The same Basic Auth (user `ai` + random token) protects the dashboard and its vi
 | `./share.sh status [name]` | Show service/session status and credentials · 查看服务/会话状态与认证信息 |
 | `./share.sh url [name]` | Re-print the access link and credentials · 重新打印访问链接与账号密码 |
 | `./share.sh hub [action]` | Session-monitor dashboard: `start`/`stop`/`status`/`url` (default `start`, port 7690) · 会话监控面板:启动/停止/状态/链接 |
+| `./share.sh sessions` | Global view of every active session (managed / ttyd / Claude / atomcode) · 全局查看所有活动中的会话与状态 |
 | `./share.sh doctor` | Environment self-check (deps / ports / LAN IP) · 环境自检(依赖/端口/局域网 IP) |
 | `./share.sh help` | Help · 帮助 |
 
@@ -206,6 +282,8 @@ The same Basic Auth (user `ai` + random token) protects the dashboard and its vi
 | `SS_PORT` | `7681` | Service port (occupied → error; unset while multiple shares run → auto-increment 7682/7683…) · 服务端口(显式指定被占时报错;未指定且被占时自动顺延) |
 | `SS_HOST` | `0.0.0.0` | Listen address (usually unchanged) · 监听地址(一般不用改) |
 | `SS_HUB_PORT` | `7690` | Session-hub dashboard port · 会话监控面板端口 |
+| `SS_HUB_URL` | auto-added to shell rc · 自动写入 shell rc | Global hub endpoint (`http://127.0.0.1:7690`) — any terminal / AI client discovers the dashboard via it · 全局面板地址,任意终端/AI 客户端据此发现监控面板 |
+| `SS_HUB_TOKEN` | — | Hub auth token via env (fallback when `hub.state` is unavailable) · 面板认证 token 的环境变量兜底(状态文件不可用时) |
 | `SS_STATE_DIR` | `~/.ai-session-share` | State directory (used by share.sh / hook / hub together) · 状态目录(share.sh/hook/hub 共用) |
 | `SS_NO_AUTH` | empty · 空 | Set `1` to disable login auth (**not recommended**) · 设 `1` 关闭登录认证(**不推荐**,见下) |
 
@@ -307,9 +385,10 @@ python3 -m py_compile hub_server.py hooks/*.py   # python syntax check · Python
 tests/test.sh                      # smoke test: deps / subcommands / real start-stop / hub / hook / ports · 冒烟测试(依赖/子命令/真实起停/面板/hook/端口)
 ```
 
-Architecture · 架构: `share.sh` (entry + all logic · 入口+全部逻辑) → depends on `tmux` (session holder · 会话持有),
-`ttyd` (WebSocket terminal), `openssl` (token generation), `python3` (hub); `install.sh` (cross-platform dependency installer · 跨平台依赖安装);
-`hub_server.py` (session-monitor dashboard + Claude live views · 会话监控面板 + Claude 实时视图);
+Architecture · 架构: `share.sh` (entry + all logic · 入口+全部逻辑) → depends on `tmux` (legacy mode · 旧模式),
+`ttyd` (WebSocket terminal), `openssl` (token), `python3` (hub/MCP); `install.sh` (cross-platform dependency installer · 跨平台依赖安装);
+`hub_server.py` (dashboard + managed-PTY hosting + programmatic API · 面板+托管 PTY+程序化 API);
+`hub_attach.py` (local attach client · 本机连接客户端); `mcp_server.py` (MCP server for AI clients · 多 AI 客户端 MCP 服务器);
 `commands/share_session.md` (slash-command template · 斜杠命令模板) + `hooks/` (zero-token session-aware UserPromptSubmit hook · 零 token 会话感知 hook).
 
 ## License · 许可

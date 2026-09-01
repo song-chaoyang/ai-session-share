@@ -120,6 +120,49 @@ install_agent_hooks() {
     }
 }
 
+# 全局环境变量:SS_HUB_URL —— 任何终端 / AI 客户端都能据此发现监控面板
+# (share attach 兜底、MCP 服务器兜底、hook 面板兜底都读它)。
+# 幂等:已存在本仓库写入的同名行则跳过;SS_RC_FILE 可覆盖目标文件(测试用)。
+install_env_var() {
+    local rc_file="${SS_RC_FILE:-}"
+    if [[ -z "$rc_file" ]]; then
+        case "$(basename "${SHELL:-/bin/bash}")" in
+            zsh)  rc_file="${HOME}/.zshrc" ;;
+            bash) rc_file="${HOME}/.bashrc" ;;
+            *)    rc_file="${HOME}/.profile" ;;
+        esac
+    fi
+    local marker="# ai-session-share (auto-added)"
+    if [[ -f "$rc_file" ]] && grep -q "export SS_HUB_URL=" "$rc_file" 2>/dev/null; then
+        # 已有同名导出:仅更新为本仓库建议值不合适(可能被用户改过),保持不动
+        log_ok "  SS_HUB_URL 已在 ${rc_file} 中配置,跳过"
+        return 0
+    fi
+    {
+        echo ""
+        echo "${marker}"
+        echo "export SS_HUB_URL=\"http://127.0.0.1:${SS_HUB_PORT:-7690}\""
+    } >> "$rc_file"
+    log_ok "  已写入 ${rc_file}: export SS_HUB_URL(新终端生效;当前终端可手动 source)"
+}
+
+# MCP 服务器注册:让任何支持 MCP 的 AI 客户端直接查看/操作会话
+install_mcp() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_warn "  python3 缺失，跳过 MCP 服务器注册"
+        return 0
+    fi
+    if [[ ! -f "${REPO_DIR}/mcp_register.py" ]]; then
+        log_warn "  缺少 ${REPO_DIR}/mcp_register.py，跳过 MCP 注册"
+        return 0
+    fi
+    log_ok "注册 MCP 服务器（AI 客户端可 list/spawn/send/read/kill 会话）..."
+    python3 "${REPO_DIR}/mcp_register.py" || {
+        log_warn "  MCP 注册部分失败（不影响其他功能）"
+        return 0
+    }
+}
+
 main() {
     local os
     os="$(detect_os)"
@@ -145,6 +188,8 @@ main() {
             install_share_cmd
             install_agent_commands
             install_agent_hooks
+            install_env_var
+            install_mcp
         else
             log_ok "下一步：把入口加入 PATH 或设置别名（或运行 ./install.sh -y 自动安装 share 命令）："
             echo "  echo \"alias share='${REPO_DIR}/share.sh'\" >> ~/.zshrc && source ~/.zshrc"
