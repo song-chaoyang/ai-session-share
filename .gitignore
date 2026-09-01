@@ -1,0 +1,12 @@
+# 运行状态与临时文件
+.state/
+*.log
+*.pid
+.DS_Store
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地工具配置(不入库)
+.codely-cli/
