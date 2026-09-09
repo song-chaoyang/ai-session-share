@@ -3,14 +3,14 @@
 
 监控本机正在运行的 AI 会话与终端会话,并输出统一的网页入口:
 
-  - tmux 会话列表(可从网页一键起 ttyd 共享,双向操作)
+  - 托管会话(自管 PTY;进程退出网页会话自动结束,双向操作)
   - Claude Code 会话列表(~/.claude/projects/**/**.jsonl,实时网页视图)
   - atomcode 会话活动(~/.atomcode/datalog/**,原始日志尾部视图)
-  - 托管会话(自管 PTY,不依赖 tmux/ttyd;进程退出网页会话自动结束)
   - 已在共享中的 ttyd 服务清单(端口/链接)
 
 设计原则:只用 Python 标准库,无任何第三方依赖;
-Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次启动重新生成)。
+Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次启动重新生成);
+终端组件(xterm.js)自托管于 /assets/,浏览器零外部 CDN 依赖。
 
 路由:
   GET  /                       仪表盘(5s 自动刷新)
@@ -18,6 +18,7 @@ Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次�
   GET  /api/ticket            申请 WebSocket 一次性票据(替代无法带 Basic Auth 的 WS)
   GET  /api/session/<id>      托管会话详情(状态+输出预览)
   GET  /api/output/<id>?tail= 托管会话最近输出(程序化读取)
+  GET  /assets/<xterm 文件>   终端组件(本地缓存自托管)
   POST /api/send/<id>         向托管会话发送键盘输入(程序化操作)
   GET  /w/<managed-id>        托管会话网页终端(xterm.js,双向)
   GET  /ws/<managed-id>?t=..  托管会话 WebSocket(PTY 直通)
@@ -26,7 +27,6 @@ Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次�
   GET  /t/<claude-session-id> Claude 会话实时视图(2s 轮询)
   GET  /t/<id>/data           Claude 会话消息 JSON
   GET  /t/a-<atomcode-slug>   atomcode 会话原始日志尾部(5s meta 刷新)
-  POST /api/share/<tmux名>     对指定 tmux 会话启动 ttyd 共享(调用 share.sh serve)
 
 环境变量:
   SS_HUB_PORT    监听端口(默认 7690)
@@ -135,31 +135,10 @@ def read_state_files():
             out.append({
                 "session": cfg.get("session", f.stem),
                 "port": port,
+                "token": cfg.get("token", ""),
                 "url": f"/open/{port}",
             })
     return out
-
-
-def tmux_sessions():
-    """tmux 会话列表(name/created/windows/attached)。"""
-    out = sh(["tmux", "list-sessions", "-F",
-              "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}"])
-    shared = {s["session"]: s["port"] for s in read_state_files()}
-    rows = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 4:
-            continue
-        name, created, windows, attached = parts
-        rows.append({
-            "name": name,
-            "created": time.strftime("%m-%d %H:%M", time.localtime(int(created))),
-            "windows": windows,
-            "attached": attached == "1",
-            "shared": name in shared,
-            "port": shared.get(name, ""),
-        })
-    return rows
 
 
 def claude_sessions():
@@ -200,6 +179,38 @@ def _jsonl_last_cwd(jf):
         return hits[-1] if hits else ""
     except OSError:
         return ""
+
+
+def _slug_to_path(slug):
+    """projects 目录名 slug → 真实路径('-Users-foo-bar' → '/Users/foo/bar' 等)。
+
+    slug 里连字符既可能是路径分隔也可能属于目录名本身(如 ai-session-share),
+    无歧义解析不可能;按位掩码枚举所有相邻段合并组合,返回第一个存在的目录,
+    失败返回空串(调用方自行兜底)。段数上限 16,枚举量 2^15 可接受。
+    """
+    parts = slug.split("-")
+    if not parts or parts[0]:
+        return ""
+    parts = parts[1:]
+    n = len(parts)
+    if n == 0 or n > 16:
+        return ""
+    # mask 的第 i 位(0-based,对应 parts[i] 与 parts[i+1] 之间)为 1 → 两段不分隔
+    # 全 1(全部合并成一个目录名)往往不是目标;全 0(全拆开)是默认路径形态。
+    # 优先级:先试"全拆开",再逐个引入合并 —— 真实项目目录两种都常见。
+    for mask in range(0, 1 << (n - 1)):
+        groups, cur = [], [parts[0]]
+        for i in range(1, n):
+            if mask & (1 << (i - 1)):
+                cur.append(parts[i])
+            else:
+                groups.append(cur)
+                cur = [parts[i]]
+        groups.append(cur)
+        cand = "/" + "/".join("-".join(g) for g in groups)
+        if os.path.isdir(cand):
+            return cand
+    return ""
 
 
 def atomcode_sessions():
@@ -263,15 +274,15 @@ def parse_claude_jsonl(path):
                         if ct == "text":
                             parts.append({"t": "text", "x": str(c.get("text", ""))[:MAX_PART]})
                         elif ct == "thinking":
-                            parts.append({"t": "tool", "x": "💭 " + str(c.get("thinking", ""))[:400]})
+                            parts.append({"t": "think", "x": str(c.get("thinking", ""))[:600]})
                         elif ct == "tool_use":
                             args = json.dumps(c.get("input", {}), ensure_ascii=False)
-                            parts.append({"t": "tool", "x": f"🔧 {c.get('name', 'tool')}  {args[:500]}"})
+                            parts.append({"t": "tool", "n": str(c.get("name", "tool")), "x": args[:800]})
                         elif ct == "tool_result":
                             rc = c.get("content", "")
                             txt = rc if isinstance(rc, str) else json.dumps(rc, ensure_ascii=False)
                             mark = "❌ " if c.get("is_error") else "↳ "
-                            parts.append({"t": "result", "x": mark + txt[:800]})
+                            parts.append({"t": "result", "x": mark + txt[:1000]})
                 if parts:
                     msgs.append({"role": typ, "ts": obj.get("timestamp", ""), "parts": parts})
     except OSError:
@@ -399,7 +410,7 @@ class WSConn:
             return opcode, data
 
 
-# ------------------------------------------------- 托管会话(自管 PTY,免 tmux)
+# ------------------------------------------------- 托管会话(自管 PTY)
 class ManagedSession:
     """一个由本服务托管的 PTY 会话。
 
@@ -421,6 +432,16 @@ class ManagedSession:
         self.buf_bytes = 0
         env = dict(os.environ)
         env["SS_MANAGED_ID"] = sid   # hook 据此识别:AI 工具运行在托管会话里
+        # 面板daemon 化后可能没有合适的 TERM(甚至没有),下游 CLI 会因此关闭彩色输出
+        # 导致网页终端里全是单色文字;强制设成 xterm.js 认得的 256 色终端类型
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        # 宿主(启动 hub 的那个终端/工具)环境里若带 NO_COLOR / FORCE_COLOR=0(常见于
+        # CI、自动化壳、部分终端外壳的"纯净输出"约定),会被子进程原样继承,导致下游
+        # CLI(如遵循 no-color.org 规范的工具)彻底不发颜色码 —— TERM 设对了也没用,
+        # 这两个变量优先级更高。网页终端(xterm.js)明确支持全彩,这里强制覆盖。
+        env.pop("NO_COLOR", None)
+        env["FORCE_COLOR"] = "1"
         pid, fd = pty.fork()
         if pid == 0:
             # 子进程:切到指定目录;关闭继承的其他 fd(hub 监听 socket、其他会话的
@@ -647,9 +668,9 @@ async function load(){
       <td><a href="${x.url}" target="_blank">打开终端 ↗</a></td></tr>`;
     if(s.shared.length)
       h += `<div class="card"><h2>📡 共享中的终端服务</h2><table>
-        <tr><th>tmux 会话</th><th>端口</th><th>链接</th></tr>${s.shared.map(sharedRow).join('')}</table></div>`;
+        <tr><th>服务</th><th>端口</th><th>链接</th></tr>${s.shared.map(sharedRow).join('')}</table></div>`;
     if(s.managed && s.managed.length){
-      h += `<div class="card"><h2>🎮 托管会话 — 免 tmux,进程退出(如 /exit)自动结束</h2><table>
+      h += `<div class="card"><h2>🎮 托管会话 — 进程退出(如 /exit)自动结束</h2><table>
         <tr><th>会话</th><th>命令</th><th>PID</th><th>客户端</th><th>状态</th><th></th></tr>` +
         s.managed.map(x=>`<tr><td class="mono">${x.id}</td><td class="mono">${_esc_js(x.cmd)}</td>
           <td class="dim">${x.pid}</td><td>${x.clients}</td>
@@ -664,18 +685,8 @@ async function load(){
 border-radius:6px;padding:5px 8px;font:13px ui-monospace,monospace">` +
         s.presets.map(c=>`<option>${c}</option>`).join('') + `</select>
         <button onclick="newS(this)">新建并打开</button>
-        <span class="dim" style="font-size:12px">不依赖 tmux;进程退出后会话自动结束;本机连接用 share attach &lt;id&gt;</span>
+        <span class="dim" style="font-size:12px">进程退出后会话自动结束;本机连接用 share attach &lt;id&gt;</span>
         </div></div>`;
-    }
-    if(s.tmux.length){
-      h += `<div class="card"><h2>⌨ tmux 会话(旧模式,可共享为双向终端)</h2><table>
-        <tr><th>会话</th><th>创建于</th><th>窗口</th><th>本机连接</th><th>状态</th><th></th></tr>` +
-        s.tmux.map(x=>`<tr><td class="mono">${x.name}</td><td class="dim">${x.created}</td>
-          <td>${x.windows}</td><td>${x.attached?'已连接':'后台'}</td>
-          <td>${x.shared?`<span class="ok">共享中 :${x.port}</span>`:'<span class="off">未共享</span>'}</td>
-          <td>${x.shared?`<a href="/open/${x.port}" target="_blank">打开 ↗</a>`
-            :`<button onclick="share('${x.name}',this)">共享此会话</button>`}</td></tr>`).join('') +
-        `</table></div>`;
     }
     if(s.claude.length){
       h += `<div class="card"><h2>🤖 Claude Code 会话(实时网页视图)</h2><table>
@@ -684,7 +695,7 @@ border-radius:6px;padding:5px 8px;font:13px ui-monospace,monospace">` +
           <td class="mono">${x.id.slice(0,8)}…</td><td class="dim">${fmtSize(x.size)}</td>
           <td>${x.live?'<span class="ok">● 活跃</span>':'<span class="off">○ '+ago(x.mtime)+'</span>'}</td>
           <td><a href="${x.url}" target="_blank">查看会话 ↗</a></td></tr>`).join('') +
-        `</table><div class="sub" style="padding:8px 16px">在托管会话或 tmux 会话里运行的 Claude 可双向操作;普通终端里的 Claude 为只读实时视图。</div></div>`;
+        `</table><div class="sub" style="padding:8px 16px">在托管会话里运行的 Claude 可双向操作;普通终端里的 Claude 为只读实时视图。</div></div>`;
     }
     if(s.atomcode.length){
       h += `<div class="card"><h2>⚛ atomcode 会话(原始日志)</h2><table>
@@ -697,15 +708,6 @@ border-radius:6px;padding:5px 8px;font:13px ui-monospace,monospace">` +
     if(!h) h = '<div class="card"><div class="empty">暂无检测到的会话</div></div>';
     document.getElementById('app').innerHTML = h;
   }catch(e){ document.getElementById('app').innerHTML = '<div class="card"><div class="empty">加载失败: '+e+'</div></div>'; }
-}
-async function share(name, btn){
-  btn.disabled = true; btn.textContent = '启动中…';
-  try{
-    const r = await fetch('/api/share/'+name, {method:'POST', headers:{'X-Share-API':'1'}});
-    const j = await r.json();
-    btn.textContent = j.ok ? '已启动 ✓' : '失败';
-    setTimeout(load, 800);
-  }catch(e){ btn.textContent = '失败'; }
 }
 async function newS(btn){
   btn.disabled = true; btn.textContent = '创建中…';
@@ -733,47 +735,172 @@ load(); setInterval(load, 5000);
     return page("会话监控", body)
 
 
-def transcript_page(session_id, path):
-    sid = _esc(session_id[:8])
-    body = f"""
-<h1>🤖 Claude 会话 <span class="mono">{sid}…</span></h1>
-<div class="sub" id="meta">加载中… · 2s 自动刷新</div>
-<div id="log" style="display:flex;flex-direction:column;gap:10px;margin-top:16px"></div>
+# Claude 会话实时视图:左右聊天气泡样式(用户右、Claude 左,头像+时间戳,
+# 工具调用/思考/结果折叠展示,轻量 Markdown 渲染,2s 轮询)。
+# 注意:模板为普通字符串(非 f-string),JS 正则里的反斜杠必须写成 \\(见 _TERMINAL_TPL 注释)。
+_TRANSCRIPT_TPL = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__SID8__ · Claude 会话</title>
+<style>__CSS__
+body{padding:0}
+header{position:sticky;top:0;z-index:9;background:#0d1117ee;backdrop-filter:blur(6px);
+border-bottom:1px solid #30363d;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+header h1{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}
+.dot{width:8px;height:8px;border-radius:50%;background:#484f58;flex:0 0 8px}
+.dot.live{background:#3fb950;box-shadow:0 0 8px #3fb95088}
+#meta{font-size:12px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#log{max-width:860px;margin:0 auto;padding:24px 16px 96px;display:flex;flex-direction:column;gap:18px}
+.row{display:flex;gap:10px;align-items:flex-start}
+.row.user{flex-direction:row-reverse}
+.av{flex:0 0 32px;width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+font-size:16px;background:#1c2129;border:1px solid #30363d}
+.col{min-width:0;max-width:82%;display:flex;flex-direction:column;gap:4px}
+.row.user .col{align-items:flex-end}
+.who{font-size:11px;color:#8b949e;padding:0 6px}
+.bubble{border-radius:14px;padding:10px 14px;line-height:1.7;word-break:break-word;white-space:pre-wrap}
+.row.user .bubble{background:#1c2d4a;border:1px solid #2d4d78;border-top-right-radius:4px;color:#dbe7f7}
+.row.asst .bubble{background:#161b22;border:1px solid #30363d;border-top-left-radius:4px}
+.bubble .code{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:10px 12px;overflow:auto;
+font:12px/1.5 ui-monospace,Menlo,monospace;margin:8px 0;white-space:pre}
+code.ic{background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:1px 6px;
+font:12px ui-monospace,Menlo,monospace}
+details{background:#10151c;border:1px solid #21262d;border-radius:10px;margin:6px 0 0;overflow:hidden;min-width:220px;max-width:100%}
+summary{cursor:pointer;padding:7px 12px;font-size:12px;color:#8b949e;user-select:none;list-style:none;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+summary::before{content:'▸ '}
+details[open] summary::before{content:'▾ '}
+summary:hover{color:#c9d1d9;background:#161b22}
+.dbody{padding:2px 12px 10px;font:11.5px/1.55 ui-monospace,Menlo,monospace;
+white-space:pre-wrap;word-break:break-word;color:#9aa7b8;max-height:420px;overflow:auto}
+.dbody.err{color:#f87272}
+details.think summary{color:#8b7ec8}
+#newbar{position:fixed;bottom:56px;left:50%;transform:translateX(-50%);background:#238636;color:#fff;
+border-radius:16px;padding:6px 18px;font-size:12px;cursor:pointer;display:none;box-shadow:0 2px 10px #0009}
+#cnt{position:fixed;bottom:0;left:0;right:0;background:#0d1117dd;backdrop-filter:blur(4px);
+border-top:1px solid #21262d;padding:7px 16px;font-size:11px;color:#58a6ff;text-align:center}
+</style></head><body>
+<header>
+  <h1><span class="dot" id="dot"></span>🤖 Claude 会话 <span class="mono dim" style="font-size:12px">__SID8__…</span></h1>
+  <div style="display:flex;gap:10px;align-items:center">
+    <button id="resume" title="以 claude --resume 从当前上下文继续,打开双向网页终端">🔄 在网页继续此会话</button>
+    <div id="meta">加载中…</div>
+  </div>
+</header>
+<div id="log"></div>
+<div id="newbar">↓ 有新消息</div>
+<div id="cnt">实时视图 · 2s 自动刷新 · 只读(要双向操作请点右上按钮)</div>
 <script>
-let stick = true;
+const SID = "__SID__";
 const log = document.getElementById('log');
-window.addEventListener('scroll', ()=>{{ stick = innerHeight+scrollY >= document.body.scrollHeight-60; }});
-async function load(){{
-  try{{
-    const r = await fetch('/t/{_esc(session_id)}/data');
+const bar = document.getElementById('newbar');
+document.getElementById('resume').onclick = async ()=>{
+  const b = document.getElementById('resume');
+  b.disabled = true; b.textContent = '创建中…';
+  try{
+    // cwd 用原会话的项目目录(取自 /t/<id>/data 的 project 字段),保证 resume
+    // 出的 Claude 落在目标运行路径而不是 $HOME
+    const d = await (await fetch('/t/'+SID+'/data')).json();
+    const r = await fetch('/api/new', {method:'POST', headers:{'Content-Type':'application/json','X-Share-API':'1'},
+      body: JSON.stringify({argv:['claude','--resume', SID], cwd: d.project})});
+    const j = await r.json();
+    if (j.ok){ location.href = j.url; return; }
+    alert('创建失败: ' + (j.error||''));
+  }catch(e){ alert('创建失败: '+e); }
+  b.disabled = false; b.textContent = '🔄 在网页继续此会话';
+};
+let stick = true, last = '';
+window.addEventListener('scroll', ()=>{ stick = innerHeight+scrollY >= document.body.scrollHeight-90;
+  if(stick) bar.style.display='none'; });
+bar.onclick = ()=>{ stick=true; bar.style.display='none'; scrollTo(0, document.body.scrollHeight); };
+function esc(s){ const d=document.createElement('div'); d.textContent = s==null ? '' : String(s); return d.innerHTML; }
+function md(s){
+  let e = String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  e = e.replace(/```[a-zA-Z0-9+#-]*\\n?([\\s\\S]*?)```/g, (m,c)=>'<div class="code">'+c+'</div>');
+  e = e.replace(/`([^`\\n]+)`/g, '<code class="ic">$1</code>');
+  e = e.replace(/\\*\\*([^*\\n]+)\\*\\*/g, '<b>$1</b>');
+  e = e.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)\\s]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  e = e.replace(/\\n/g, '<br>');
+  return e;
+}
+function part(p){
+  if (p.t==='text') return '<div class="bubble">'+md(p.x)+'</div>';
+  if (p.t==='think') return '<details class="think"><summary>💭 思考过程</summary><div class="dbody">'+esc(p.x)+'</div></details>';
+  if (p.t==='tool') return '<details class="tool"><summary>🔧 '+(p.n?esc(p.n):'工具调用')+'</summary><div class="dbody">'+esc(p.x)+'</div></details>';
+  if (p.t==='result') return '<details class="res"><summary>↳ '+(p.x && p.x.indexOf('❌')===0?'执行出错':'执行结果')+'</summary><div class="dbody'+(p.x && p.x.indexOf('❌')===0?' err':'')+'">'+esc(p.x)+'</div></details>';
+  return '';
+}
+function render(m){
+  const row=document.createElement('div');
+  row.className = 'row ' + (m.role==='user' ? 'user' : 'asst');
+  const av=document.createElement('div'); av.className='av'; av.textContent = m.role==='user' ? '👤' : '🤖';
+  const col=document.createElement('div'); col.className='col';
+  const who=document.createElement('div'); who.className='who';
+  who.textContent = (m.role==='user' ? '我' : 'Claude') + (m.ts ? ' · '+m.ts.replace('T',' ').slice(5,16) : '');
+  col.appendChild(who);
+  let html='';
+  for(const p of m.parts) html += part(p);
+  col.insertAdjacentHTML('beforeend', html);
+  row.appendChild(av); row.appendChild(col);
+  return row;
+}
+async function tick(){
+  try{
+    const r = await fetch('/t/'+SID+'/data');
     const d = await r.json();
+    const dot=document.getElementById('dot');
+    dot.className = 'dot' + (d.live ? ' live' : '');
     document.getElementById('meta').textContent =
-      (d.live ? '● 活跃 · ' : '○ 最后活动 ' ) + d.msgs + ' 条消息 · ' + d.project + ' · 2s 自动刷新';
+      (d.live ? '活跃中' : '空闲') + ' · ' + d.msgs.length + ' 条消息 · 2s 刷新';
+    const j = JSON.stringify(d.msgs);
+    if (j===last) return;
+    last = j;
     log.innerHTML = '';
-    for(const m of d.msgs){{
-      const div = document.createElement('div');
-      div.style.cssText = m.role==='user'
-        ? 'background:#1a2332;border:1px solid #26344d;border-radius:8px;padding:8px 12px'
-        : 'background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px 12px';
-      const head = document.createElement('div');
-      head.className = 'dim'; head.style.fontSize = '11px'; head.style.marginBottom = '4px';
-      head.textContent = (m.role==='user' ? '👤 用户' : '🤖 Claude') + (m.ts ? ' · ' + m.ts.replace('T',' ').slice(0,19) : '');
-      div.appendChild(head);
-      for(const p of m.parts){{
-        const el = document.createElement('div');
-        el.textContent = p.x;
-        if(p.t === 'text'){{ el.style.whiteSpace = 'pre-wrap'; el.style.wordBreak = 'break-word'; }}
-        else {{ el.className = 'dim'; el.style.cssText += ';font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;word-break:break-word;padding:2px 0'; }}
-        div.appendChild(el);
-      }}
-      log.appendChild(div);
-    }}
-    if(stick) scrollTo(0, document.body.scrollHeight);
-  }}catch(e){{}}
-}}
-load(); setInterval(load, 2000);
-</script>"""
-    return page(f"Claude {sid}", body)
+    for(const m of d.msgs) log.appendChild(render(m));
+    if (stick) scrollTo(0, document.body.scrollHeight);
+    else bar.style.display='block';
+  }catch(e){}
+}
+tick(); setInterval(tick, 2000);
+</script></body></html>"""
+
+
+def transcript_page(session_id, path):
+    return (_TRANSCRIPT_TPL
+            .replace("__CSS__", CSS)
+            .replace("__SID__", html.escape(session_id, quote=True))
+            .replace("__SID8__", html.escape(session_id[:8], quote=True)))
+
+
+# 共享终端访问信息页:浏览器已禁用 URL 内嵌凭据自动登录,直接展示地址与该服务自己的密码
+def open_page(port, entry, host):
+    token = entry.get("token", "")
+    url = f"http://{host}:{port}"
+    cred_rows = (
+        f'<tr><th>用户名</th><td class="mono">{AUTH_USER}</td></tr>\n'
+        f'    <tr><th>密码</th><td class="mono" id="pw">{_esc(token)}</td></tr>'
+        if token else
+        '<tr><th>认证</th><td>已关闭(直接打开即可)</td></tr>')
+    body = f"""
+<h1>🔓 共享终端 · {_esc(entry.get("session", ""))}</h1>
+<div class="card" style="max-width:600px;margin:16px auto">
+  <h2>访问信息(与面板密码不同,是本服务自己的密码)</h2>
+  <table>
+    <tr><th>地址</th><td class="mono"><a href="{_esc(url)}" target="_blank">{_esc(url)}</a></td></tr>
+    {cred_rows}
+  </table>
+  <div style="padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap">
+    <a href="{_esc(url)}" target="_blank"
+       style="display:inline-block;background:#238636;color:#fff;border-radius:6px;padding:8px 20px;
+              text-decoration:none;font-size:14px">打开终端 ↗</a>
+    <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('pw').textContent)">
+       复制密码</button>
+  </div>
+  <div class="sub" style="padding:0 16px 14px;font-size:12px">
+    现代浏览器已禁用"URL 内嵌账号密码"的自动登录,打开地址后输入上面的账号密码即可。
+  </div>
+</div>
+<div style="text-align:center"><a href="/" style="color:#58a6ff">← 返回会话监控面板</a></div>"""
+    return page(f"共享终端 {entry.get('session', '')}", body)
 
 
 def atom_page(slug, path):
@@ -793,12 +920,15 @@ margin-top:16px;font-size:12px;overflow:auto;white-space:pre-wrap;word-break:bre
     return page(f"atomcode {slug}", body, refresh=5)
 
 
-# 托管会话终端页:xterm.js(经 jsdelivr CDN,不可达时降级为简易行输入模式)
+# 托管会话终端页:xterm.js 由本服务 /assets/ 自托管(首次访问时自动下载缓存,
+# 无外网 CDN 依赖,避免 Tracking Prevention / 内网隔离环境加载失败),加载失败降级为简易行输入。
+# 注意:模板内 JS 出现的反斜杠必须写成 \\(Python 字面量),否则真实换行会破坏 JS 字符串字面量。
 _TERMINAL_TPL = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__SID__ · ai-session-share</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<link rel="stylesheet" href="/assets/xterm.css">
+<script src="/assets/xterm.js"></script>
+<script src="/assets/xterm-fit.js"></script>
 <style>__CSS__</style></head>
 <body style="overflow:hidden">
 <div style="position:fixed;top:0;left:0;right:0;height:36px;background:#161b22;border-bottom:1px solid #30363d;
@@ -809,7 +939,7 @@ display:flex;justify-content:space-between;align-items:center;padding:0 14px;z-i
 </div>
 <div id="term" style="position:fixed;top:36px;left:0;right:0;bottom:0"></div>
 <div id="fallback" style="display:none;position:fixed;top:36px;left:0;right:0;bottom:0;overflow:auto;padding:8px">
-  <div style="color:#d29922;font:12px sans-serif;padding:4px">xterm.js 加载失败(CDN 不可达),已降级为简易模式:仅支持整行回车发送。</div>
+  <div style="color:#d29922;font:12px sans-serif;padding:4px">终端组件未就绪,已降级为简易模式:仅支持整行回车发送。</div>
   <pre id="flog" style="white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;color:#c9d1d9"></pre>
   <input id="fin" style="position:fixed;bottom:0;left:0;width:100%;background:#161b22;border:none;
 border-top:1px solid #30363d;color:#c9d1d9;padding:8px;font:12px ui-monospace,monospace" placeholder="输入后回车发送">
@@ -822,14 +952,34 @@ const enc = new TextEncoder(); const dec = new TextDecoder();
 function fb(t){ document.getElementById('flog').textContent += t; document.getElementById('fallback').scrollTop = 1e9; }
 async function boot(){
   if (window.Terminal){
-    term = new Terminal({cursorBlink:true, fontSize:13, theme:{background:'#0d1117', cursor:'#c9d1d9'}});
+    term = new Terminal({
+      cursorBlink:true, fontSize:13, fontFamily:'ui-monospace,Menlo,Consolas,monospace',
+      theme:{
+        background:'#0d1117', foreground:'#c9d1d9', cursor:'#c9d1d9', cursorAccent:'#0d1117',
+        selectionBackground:'rgba(88,166,255,.35)',
+        black:'#484f58', red:'#ff7b72', green:'#3fb950', yellow:'#d29922',
+        blue:'#58a6ff', magenta:'#bc8cff', cyan:'#39c5cf', white:'#b1bac4',
+        brightBlack:'#6e7681', brightRed:'#ffa198', brightGreen:'#56d364', brightYellow:'#e3b341',
+        brightBlue:'#79c0ff', brightMagenta:'#d2a8ff', brightCyan:'#56d4dd', brightWhite:'#f0f6fc'
+      }
+    });
+    // 关键顺序:先 open(挂到 DOM)再 fit(量容器尺寸) —— 反了就只能用默认 80x24 的初始盒
     term.open(document.getElementById('term'));
+    try {
+      if (window.FitAddon){
+        const fit = new FitAddon.FitAddon(); term.loadAddon(fit);
+        fit.fit();
+        window.addEventListener('resize', ()=>{ try{ fit.fit(); }catch(_){} });
+        // 首帧渲染前容器可能还未定型(字体/布局异步),下一帧再 fit 一次兜底
+        requestAnimationFrame(()=>{ try{ fit.fit(); }catch(_){} });
+      }
+    } catch(_){}
   } else {
     document.getElementById('fallback').style.display='block';
     document.getElementById('term').style.display='none';
     document.getElementById('fin').addEventListener('keydown', e=>{
       if (e.key==='Enter' && ws && ws.readyState===1){
-        ws.send(document.getElementById('fin').value+'\n'); document.getElementById('fin').value='';
+        ws.send(document.getElementById('fin').value+'\\n'); document.getElementById('fin').value='';
       }
     });
   }
@@ -880,6 +1030,59 @@ def ended_page(sid):
     return page("会话已结束", body)
 
 
+# ------------------------------------------------- 终端组件自托管(/assets/)
+# xterm.js 由本服务从 /assets/ 提供:首次访问时下载并缓存到 STATE_DIR/assets/,
+# 之后浏览器不再访问任何外部 CDN —— Tracking Prevention / 内网隔离都不影响。
+XTERM_VERSION = "5.5.0"
+FIT_VERSION = "0.10.0"
+ASSETS = {
+    # 文件名: (下载源, 合法性最小字节数, Content-Type)
+    "xterm.js": (
+        f"https://cdn.jsdelivr.net/npm/@xterm/xterm@{XTERM_VERSION}/lib/xterm.js",
+        100_000, "application/javascript"),
+    "xterm.css": (
+        f"https://cdn.jsdelivr.net/npm/@xterm/xterm@{XTERM_VERSION}/css/xterm.min.css",
+        200, "text/css"),
+    "xterm-fit.js": (
+        f"https://cdn.jsdelivr.net/npm/@xterm/addon-fit@{FIT_VERSION}/lib/addon-fit.js",
+        500, "application/javascript"),
+}
+_ASSET_LOCK = threading.Lock()
+
+
+def fetch_asset(name):
+    """取终端组件:缓存命中直接返回;否则下载缓存(原子替换)。失败返回 None。"""
+    url, min_size, _ = ASSETS[name]
+    dest = STATE_DIR / "assets" / name
+    try:
+        if dest.is_file() and dest.stat().st_size >= min_size:
+            return dest
+    except OSError:
+        pass
+    with _ASSET_LOCK:
+        try:
+            if dest.is_file() and dest.stat().st_size >= min_size:
+                return dest
+        except OSError:
+            pass
+        tmp = dest.with_name(dest.name + ".tmp")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "ai-session-share/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r, open(tmp, "wb") as f:
+                f.write(r.read())
+            if tmp.stat().st_size >= min_size:
+                tmp.replace(dest)
+                return dest
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return None
+
+
 # ---------------------------------------------------------------- HTTP 服务
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -891,9 +1094,18 @@ class Handler(BaseHTTPRequestHandler):
     def authorized(self):
         if NO_AUTH or not TOKEN:
             return True
+        if getattr(self, "_cookie_login", False):
+            return True
         header = self.headers.get("Authorization", "")
         expected = "Basic " + base64.b64encode(f"{AUTH_USER}:{TOKEN}".encode()).decode()
-        return hmac.compare_digest(header, expected)
+        if hmac.compare_digest(header, expected):
+            return True
+        # Cookie 兜底:?key=token 免密登录链接种下的 cookie,后续请求(含刷新/WS)自动带上
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "ss_auth" and v and hmac.compare_digest(v, TOKEN):
+                return True
+        return False
 
     def deny(self):
         self.send_response(401)
@@ -911,6 +1123,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_cookie_login", False) and TOKEN:
+            # ?key=token 免密登录成功:种 30 天 cookie,之后打开链接/刷新都不用再输密码
+            self.send_header("Set-Cookie", f"ss_auth={TOKEN}; Path=/; Max-Age=2592000; SameSite=Lax")
         self.end_headers()
         self.wfile.write(data)
 
@@ -921,6 +1136,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         raw = self.path
         path = raw.split("?", 1)[0].rstrip("/") or "/"
+        qs = urllib.parse.parse_qs(raw.split("?", 1)[1]) if "?" in raw else {}
+
+        # ?key=token 免密登录:与 Basic Auth 等价的另一种认证方式(不是内嵌凭据 URL,
+        # 只是普通查询参数,不会被浏览器拦截),验证通过后 reply() 会顺手种 cookie,
+        # 之后同源的刷新/跳转/WS 连接都自动带凭据,不用再输账号密码。
+        key = qs.get("key", [""])[0]
+        self._cookie_login = bool(key) and not NO_AUTH and bool(TOKEN) and hmac.compare_digest(key, TOKEN)
 
         # /ws/<id>?t=…:WebSocket 升级(浏览器 WS 无法携带 Basic Auth,用一次性票据)
         m = re.fullmatch(r"/ws/([A-Za-z0-9_-]+)", path)
@@ -937,13 +1159,32 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply_json({
                 "hub": {"port": HUB_PORT},
                 "shared": read_state_files(),
-                "tmux": tmux_sessions(),
                 "claude": claude_sessions(),
                 "atomcode": atomcode_sessions(),
                 "managed": MANAGED.list(),
                 "presets": [c for c in ("bash", "zsh", "claude", "atomcode", "codex")
                             if shutil.which(c)],
             })
+
+        # 终端组件自托管(本地缓存,无 CDN 依赖)
+        m = re.fullmatch(r"/assets/(xterm(?:-fit)?\.(?:js|css))", path)
+        if m:
+            dest = fetch_asset(m.group(1))
+            if not dest:
+                return self.reply(404, "404 终端组件未缓存且下载失败(可稍后重试或检查网络)",
+                                 "text/plain; charset=utf-8")
+            try:
+                data = dest.read_bytes()
+            except OSError:
+                return self.reply(404, "404", "text/plain; charset=utf-8")
+            ctype = ASSETS[m.group(1)][2]
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
         if path == "/api/ticket":
             now = time.time()
@@ -994,14 +1235,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, ended_page(m.group(1)))
             return self.reply(200, terminal_page(sess.id, sess))
 
-        # /open/<port> → 跳到对应 ttyd(带凭据的一键登录)
+        # /open/<port> → 共享终端访问信息页。
+        # 不能再做"带凭据重定向":现代浏览器禁用 URL 内嵌账号密码自动登录,
+        # 且 ttyd 服务的密码与面板密码不同 —— 如实展示该服务自己的地址与密码。
         m = re.fullmatch(r"/open/(\d+)", path)
         if m:
-            self.send_response(302)
-            self.send_header("Location", f"http://{AUTH_USER}:{TOKEN}@{self.headers.get('Host', '127.0.0.1').split(':')[0]}:{m.group(1)}/")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+            entry = next((s for s in read_state_files() if s["port"] == m.group(1)), None)
+            if not entry:
+                return self.reply(404, "404 没有运行中的共享终端服务", "text/plain; charset=utf-8")
+            host = (self.headers.get("Host") or "").split(":")[0] or lan_ip()
+            return self.reply(200, open_page(m.group(1), entry, host))
 
         # /t/<id>[/data]
         m = re.fullmatch(r"/t/([A-Za-z0-9-]+)(/data)?", path)
@@ -1033,7 +1276,7 @@ class Handler(BaseHTTPRequestHandler):
                 st = jf.stat()
                 return self.reply_json({
                     "live": time.time() - st.st_mtime < LIVE_SEC,
-                    "project": _jsonl_last_cwd(jf) or jf.parent.name,
+                    "project": _jsonl_last_cwd(jf) or _slug_to_path(jf.parent.name),
                     "mtime": st.st_mtime,
                     "msgs": parse_claude_jsonl(jf),
                 })
@@ -1094,7 +1337,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             sess.remove_conn(ws)
 
-    # -- POST:/api/share/<tmux名> | /api/new | /api/kill/<id> --
+    # -- POST:/api/new | /api/send | /api/kill --
     def do_POST(self):
         # 防 CSRF:跨站请求无法携带自定义头
         if self.headers.get("X-Share-API") != "1":
@@ -1119,9 +1362,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply_json({"ok": False, "error": f"命令不存在: {argv[0]}"}, 400)
             if MANAGED.running_count() >= MAX_MANAGED:
                 return self.reply_json({"ok": False, "error": f"托管会话已达上限({MAX_MANAGED})"}, 429)
-            cwd = body.get("cwd") or str(HOME)
+            cwd = body.get("cwd")
             if not isinstance(cwd, str) or not os.path.isdir(cwd):
-                cwd = str(HOME)
+                # claude --resume 未指定 cwd 时:从会话 jsonl 解析原项目目录,
+                # 避免 resume 出来落在 $HOME 读不到项目上下文
+                if argv[:2] == ["claude", "--resume"] and len(argv) >= 3 \
+                        and re.fullmatch(r"[A-Za-z0-9-]+", argv[2]):
+                    jf = find_claude_jsonl(argv[2])
+                    if jf:
+                        last = _jsonl_last_cwd(jf)
+                        if last and os.path.isdir(last):
+                            cwd = last
+                if not isinstance(cwd, str) or not os.path.isdir(cwd):
+                    cwd = str(HOME)
             try:
                 sess = MANAGED.spawn(argv, cwd)
             except (RuntimeError, OSError) as e:
@@ -1153,20 +1406,7 @@ class Handler(BaseHTTPRequestHandler):
             sess.write(text.encode())
             return self.reply_json({"ok": True, "id": sess.id})
 
-        m = re.fullmatch(r"/api/share/([A-Za-z0-9_-]+)", path)
-        if not m:
-            return self.reply_json({"ok": False, "error": "路径不合法"}, 404)
-        name = m.group(1)
-        if not SHARE_SH.exists():
-            return self.reply_json({"ok": False, "error": f"找不到 share.sh: {SHARE_SH}"}, 500)
-        env = {k: v for k, v in os.environ.items() if k not in ("SS_PORT", "SS_SESSION")}
-        try:
-            r = subprocess.run(["bash", str(SHARE_SH), "serve", name],
-                               capture_output=True, text=True, timeout=30, env=env)
-            ok = r.returncode == 0
-            return self.reply_json({"ok": ok, "output": (r.stdout or r.stderr)[-2000:]})
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return self.reply_json({"ok": False, "error": str(e)}, 500)
+        return self.reply_json({"ok": False, "error": "路径不合法"}, 404)
 
 
 def _api_call(port, token, method, path, body=None):
@@ -1261,7 +1501,7 @@ def api_cli():
         mg = [x for x in d.get("managed", []) if not x.get("exited")]
         ended = [x for x in d.get("managed", []) if x.get("exited")]
         if mg:
-            print("托管会话(免 tmux,进程退出自动结束):")
+            print("托管会话(进程退出自动结束):")
             for x in mg:
                 print(f"  {x['id']}  ● 运行中  客户端 {x['clients']}  {x['cmd']}")
                 print(f"    网页: {base}/w/{x['id']}   本机: share attach {x['id']}   结束: share kill {x['id']}")
@@ -1305,7 +1545,7 @@ def api_cli():
 
 def _daemonize():
     """双 fork + setsid 脱离调用者的会话/进程组:
-    终端关闭、父进程组被清理都不会波及面板(与 tmux/ttyd 常驻同理)。
+    终端关闭、父进程组被清理都不会波及面板(与常驻服务同理)。
     stdio 重定向: stdin=/dev/null, stdout/stderr=hub.log(追加)。"""
     log_path = STATE_DIR / "hub.log"
     try:
@@ -1345,11 +1585,15 @@ def main():
     if os.environ.get("SS_HUB_DAEMON") == "1":
         _daemonize()                 # 先守护化(脱离进程组),再绑定端口/写状态
 
+    # 预热终端组件(后台尽力而为):首次访问 /w/ 页面时资源多半已就绪
+    threading.Thread(target=lambda: [fetch_asset(n) for n in ASSETS], daemon=True).start()
+
     srv = ThreadingHTTPServer(("0.0.0.0", HUB_PORT), Handler)
 
     # 状态文件由最终进程自己写(pid 才是真实的守护进程 pid);绑定成功后才写
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)   # token 等敏感状态仅本用户可读(与 README 安全章节一致)
         (STATE_DIR / "hub.state").write_text(
             f"port={HUB_PORT}\ntoken={TOKEN}\npid={os.getpid()}\n"
             f"started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")

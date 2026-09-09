@@ -12,7 +12,8 @@
 #   share.sh serve [name]   仅启动 Web 服务（共享一个已存在的 tmux 会话，适合已在会话里干活时另开终端调用）
 #   share.sh here [name]    在会话内一键共享：自动识别"当前所在的" tmux 会话并起服务（无需另开终端、无需记会话名）
 #   share.sh new [opts] <命令...>  新建托管会话（不依赖 tmux）：起服务+打印链接+进入会话；
-#                                  进程退出（如 Claude 里 /exit）后网页会话自动结束。opts：--no-attach 不进入
+#                                  进程退出（如 Claude 里 /exit）后网页会话自动结束。
+#                                  opts：--no-attach 不进入；--cwd <目录> 指定工作目录(默认当前目录)
 #   share.sh attach <id>    本机终端连接到托管会话（关闭终端不会结束会话）
 #   share.sh kill <id>      强制结束托管会话
 #   share.sh sessions       全局查看所有活动中的会话与状态（托管/ttyd/Claude/atomcode）
@@ -122,6 +123,7 @@ hub_log_path()   { echo "${STATE_DIR}/hub.log"; }
 
 save_state() {
     mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
     cat > "$(state_path)" <<EOF
 session=${SESSION}
 pid=${TTYD_PID}
@@ -205,6 +207,7 @@ start_ttyd() {
     resolve_port
 
     mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
     TTYD_PID=""
     TOKEN=""
     # 注意：ttyd 默认即监听 0.0.0.0；实测 1.7.7 中 -a/--address 与 -c/--credential
@@ -277,13 +280,14 @@ print_urls() {
     if [[ -n "$token" ]]; then
         log "  浏览器登录: 用户名 ${AUTH_USER}，密码 ${token}"
         if [[ ${#ips[@]} -gt 0 ]]; then
-            log "  一键登录（点击即用，无需手输密码）:"
+            log "  免密登录链接（打开即自动登录，无需手输账号密码，30 天内有效）:"
             for ip in "${ips[@]}"; do
-                log "    http://${AUTH_USER}:${token}@${ip}:${port}${path}"
+                log "    http://${ip}:${port}${path}?key=${token}"
             done
         fi
-        log "  提示: 密码在每次 start/serve 时都会重新生成；若提示密码错误，"
-        log "        请换无痕窗口或清除该地址的缓存凭据（服务重启后浏览器常缓存旧密码）"
+        log "  说明: 上面的免密链接用查询参数传递凭据(不是被浏览器禁用的\"URL 内嵌账号密码\"),"
+        log "        打开一次后会写入 cookie；也可以直接输入用户名密码手动登录。"
+        log "        分享免密链接等于分享密码，请仅在可信网络内使用。"
     else
         log_warn "  认证已关闭（SS_NO_AUTH=1）——任何局域网内的人都可直接操作你的终端，仅限可信网络！"
     fi
@@ -418,6 +422,7 @@ cmd_hub_start() {
         die "监控面板端口 ${HUB_PORT} 已被占用，可用 SS_HUB_PORT=xxxx ./share.sh hub start 换端口"
     fi
     mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
     local hub_token=""
     if [[ "${SS_NO_AUTH:-0}" != "1" ]]; then
         hub_token="$(gen_token)"
@@ -446,7 +451,7 @@ cmd_hub_start() {
     echo
     log_ok "全局环境变量（新终端自动生效，见 install.sh）: SS_HUB_URL=http://127.0.0.1:${HUB_PORT}"
     log_ok "活动会话一览: share sessions    本机 MCP 接入: python3 ${REPO_DIR}/mcp_server.py"
-    log_ok "面板监控: tmux 会话 / 托管会话(免 tmux) / Claude Code 会话(实时网页视图) / atomcode 活动"
+    log_ok "面板监控: 托管会话 / Claude Code 会话(实时网页视图) / atomcode 活动"
     log_ok "停止面板: share.sh hub stop"
 }
 
@@ -511,11 +516,12 @@ cmd_hub_url() {
 # 生命周期与会话进程严格绑定 —— 进程退出(如 Claude 里 /exit)后网页会话自动结束。
 cmd_new() {
     need_cmds python3
-    local no_attach=0 args=()
+    local no_attach=0 cwd="" args=()
     # 已知 cmd_new 收到的是命令及参数(首个 "new" 已在 main 中 shift 掉)
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-attach) no_attach=1 ;;
+            --cwd) shift; cwd="${1:-}" ;;
             --) shift; args+=("$@"); break ;;
             *) args+=("$1") ;;
         esac
@@ -524,6 +530,11 @@ cmd_new() {
     if [[ ${#args[@]} -eq 0 ]]; then
         args=("${SHELL:-/bin/bash}")
     fi
+    if [[ -n "$cwd" && ! -d "$cwd" ]]; then
+        log_warn "指定目录不存在: ${cwd}，改用当前目录 ${PWD}"
+        cwd=""
+    fi
+    cwd="${cwd:-$PWD}"
 
     if ! hub_is_running; then
         if ! cmd_hub_start >/dev/null 2>&1; then
@@ -534,7 +545,7 @@ cmd_new() {
     hub_load_state
 
     local hub_json sid
-    hub_json="$(python3 "${REPO_DIR}/hub_server.py" api new "$PWD" "${args[@]}")" \
+    hub_json="$(python3 "${REPO_DIR}/hub_server.py" api new "$cwd" "${args[@]}")" \
         || { log_err "创建托管会话失败"; return 1; }
     sid="$(echo "$hub_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
     if [[ -z "$sid" ]]; then
@@ -544,7 +555,7 @@ cmd_new() {
 
     echo
     log "托管会话已创建: ${sid}"
-    log "  命令: ${args[*]}"
+    log "  命令: ${args[*]}   目录: ${cwd}"
     echo
     log "浏览器访问（手机也可，双向操作同一会话）:"
     print_urls "${HUB_STATE_PORT:-$HUB_PORT}" "${HUB_STATE_TOKEN:-}" "/w/${sid}"
@@ -627,7 +638,7 @@ cmd_doctor() {
 }
 
 cmd_help() {
-    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------- 入口 ----------

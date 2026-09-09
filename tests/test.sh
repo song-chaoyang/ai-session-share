@@ -143,6 +143,11 @@ fi
 # --- 9. url / status 子命令 ---
 say "url / status 子命令"
 if SS_PORT="$PORT" "$SHARE" url "$SESSION" | grep -q ":${PORT}"; then ok "url 输出链接"; else bad "url 输出异常"; fi
+if SS_PORT="$PORT" "$SHARE" url "$SESSION" | grep -q "一键登录"; then
+    bad "url 仍输出一键登录(内嵌凭据)链接"
+else
+    ok "url 无内嵌凭据链接"
+fi
 if SS_PORT="$PORT" "$SHARE" status "$SESSION" | grep -q "运行中"; then ok "status 显示运行中"; else bad "status 输出异常"; fi
 
 # --- 10. stop ---
@@ -270,6 +275,11 @@ if [[ "$code_t" == "200" ]]; then
 else
     bad "会话视图页面应 200，实际 ${code_t}"
 fi
+if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/t/${FAKE_SID}" 2>/dev/null | grep -q "bubble"; then
+    ok "会话视图为左右气泡聊天样式"
+else
+    bad "会话视图缺气泡样式"
+fi
 if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/t/${FAKE_SID}/data" \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["msgs"]; sys.exit(0 if len(m)>=2 and any("FAKE_USER_MARKER" in p["x"] for p in m[0]["parts"]) and any("FAKE_ASSISTANT_MARKER" in p["x"] for x in [m[1]] for p in x["parts"]) else 1)' 2>/dev/null; then
     ok "会话消息解析正确（用户/助手内容齐全）"
@@ -285,8 +295,10 @@ fi
 
 # --- 16. hook：不在 tmux 内 → 输出当前 Claude 会话的实时视图链接 ---
 say "hook 会话感知（非 tmux）"
-HOOK_OUT="$(printf '{"prompt":"/share_session","session_id":"%s"}' "$FAKE_SID" \
-    | SS_HUB_PORT="$HUB_PORT" SS_CLAUDE_DIR="$FAKE_CLAUDE" SS_STATE_DIR="$STATE_DIR" \
+# SS_HOOK_VIEW_ONLY=1:确定性测只读视图分支(默认行为会 spawn claude --resume 托管会话,真实跑)
+HOOK_OUT="$(printf '{"prompt":"/share_session","session_id":"%s","transcript_path":"%s/%s.jsonl"}' \
+    "$FAKE_SID" "$FAKE_PROJ" "$FAKE_SID" \
+    | SS_HOOK_VIEW_ONLY=1 SS_HUB_PORT="$HUB_PORT" SS_CLAUDE_DIR="$FAKE_CLAUDE" SS_STATE_DIR="$STATE_DIR" \
       python3 "$REPO/hooks/share_session_hook.py" 2>/dev/null)"
 if echo "$HOOK_OUT" | grep -q "decision.*block"; then
     ok "hook 返回 block 决策（零 token）"
@@ -297,6 +309,16 @@ if echo "$HOOK_OUT" | grep -q ":${HUB_PORT}/t/${FAKE_SID}"; then
     ok "hook 输出当前会话实时视图链接 (/t/${FAKE_SID})"
 else
     bad "hook 未输出当前会话链接，输出: $(echo "$HOOK_OUT" | head -c 300)"
+fi
+if echo "$HOOK_OUT" | grep -q "在网页继续此会话"; then
+    ok "hook 提示可在网页继续会话"
+else
+    bad "hook 缺少继续会话提示"
+fi
+if echo "$HOOK_OUT" | grep -qE "http://ai:[0-9a-f]+@"; then
+    bad "hook 仍输出内嵌凭据链接(浏览器已禁用)"
+else
+    ok "无内嵌凭据链接(纯地址+密码)"
 fi
 if echo "$HOOK_OUT" | grep -q ":7681"; then
     bad "hook 错误地输出了其他会话(7681)的链接"
@@ -331,6 +353,19 @@ if [[ -n "$IDEM_PORT" ]] && curl -s -o /dev/null -w '%{http_code}' "http://127.0
     ok "幂等服务端口 ${IDEM_PORT} 仍正常响应"
 else
     bad "幂等服务端口 ${IDEM_PORT} 无响应"
+fi
+# /open/ 访问信息页:必须展示该 ttyd 服务自己的密码(而非面板密码),且不做带凭据重定向
+IDEM_TOKEN="$(grep '^token=' "${STATE_DIR}/idemtest.state" 2>/dev/null | cut -d= -f2)"
+OPEN_OUT="$(curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/open/${IDEM_PORT}" 2>/dev/null)"
+if [[ -n "$IDEM_TOKEN" ]] && echo "$OPEN_OUT" | grep -q "$IDEM_TOKEN" && ! echo "$OPEN_OUT" | grep -q "${HUB_TOKEN}"; then
+    ok "/open/ 显示该服务自己的密码(非面板密码)"
+else
+    bad "/open/ 凭据展示错误"
+fi
+if echo "$OPEN_OUT" | grep -q "Location"; then
+    bad "/open/ 仍是带凭据重定向"
+else
+    ok "/open/ 为信息页(无内嵌凭据重定向)"
 fi
 # 自动选端口：默认 7681 被占时应顺延（本机有正在共享的服务或 CI 空闲则用 7681 本身）
 tmux new-session -d -s autoport
@@ -385,8 +420,8 @@ else
     bad "hub status 仍显示运行"
 fi
 
-# --- 20. 托管会话(自管 PTY,不依赖 tmux) ---
-say "托管会话(免 tmux,生命周期绑定)"
+# --- 20. 托管会话(自管 PTY,生命周期绑定) ---
+say "托管会话(生命周期绑定)"
 if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub start >/dev/null 2>&1; then
     ok "hub 重启成功(承载托管会话)"
 else
@@ -541,13 +576,46 @@ fi
 # --- 27. hub send/output/session 程序化 API ---
 say "hub 程序化 API(send/output/session)"
 # 26 的强制停止测试后需要重新拉起面板,后续 API/MCP/全局发现测试都依赖它
-if SS_HUB_PORT="$HUB_PORT" "$SHARE" hub start >/dev/null 2>&1; then
+# (SS_CLAUDE_DIR 必须继续指向伪造目录,resume-cwd 兜底测试依赖它)
+if SS_HUB_PORT="$HUB_PORT" SS_CLAUDE_DIR="$FAKE_CLAUDE" "$SHARE" hub start >/dev/null 2>&1; then
     ok "hub 重启成功(承载程序化 API/MCP)"
 else
     bad "hub 重启失败"
 fi
 sleep 1
 HUB_TOKEN="$(grep '^token=' "${STATE_DIR}/hub.state" 2>/dev/null | cut -d= -f2)"
+# claude --resume 服务端 cwd 兜底:伪造带 cwd 的会话 jsonl,POST 不带 cwd,应落 /tmp 而非 $HOME
+FAKE_PROJ2="${FAKE_CLAUDE}/-private-tmp-fakeproj2"
+mkdir -p "$FAKE_PROJ2"
+FAKE_SID2="99999999-8888-7777-6666-555555555555"
+printf '{"type":"user","message":{"role":"user","content":"probe"},"cwd":"/tmp","timestamp":"2026-09-01T10:00:00.000Z"}\n' \
+    > "${FAKE_PROJ2}/${FAKE_SID2}.jsonl"
+if curl -s -X POST -H 'Content-Type: application/json' -H 'X-Share-API: 1' \
+        -u "ai:${HUB_TOKEN}" -d '{"argv":["claude","--resume","'"${FAKE_SID2}"'"]}' \
+        "http://127.0.0.1:${HUB_PORT}/api/new" | grep -q '"ok": *true'; then
+    sleep 1
+    RESUME_SID="$(python3 "$REPO/hub_server.py" api state | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(next((x['id'] for x in d['managed'] if '--resume ${FAKE_SID2}' in x['cmd'] and not x['exited']), ''))")"
+    if [[ -n "$RESUME_SID" ]]; then
+        RPID="$(python3 "$REPO/hub_server.py" api session "$RESUME_SID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])')"
+        RCWD="$(lsof -p "$RPID" 2>/dev/null | awk '$4=="cwd" {print $NF; exit}')"
+        # /tmp 在 macOS 上是 /private/tmp 的软链,按真实路径归一后比较
+        RCWD_REAL="$(cd "$RCWD" 2>/dev/null && pwd -P)"
+        TMP_REAL="$(cd /tmp && pwd -P)"
+        if [[ "$RCWD_REAL" == "$TMP_REAL" ]]; then
+            ok "claude --resume 服务端兜底解析出原会话 cwd(/tmp)"
+        else
+            bad "resume cwd 兜底失败,实际: ${RCWD:-未知}"
+        fi
+        python3 "$REPO/hub_server.py" api kill "$RESUME_SID" >/dev/null 2>&1
+    else
+        bad "resume 测试会话未找到"
+    fi
+else
+    bad "resume cwd 测试创建失败"
+fi
 API_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
 if [[ "$API_SID" == m* ]]; then
     sleep 0.5
@@ -710,6 +778,125 @@ else
     bad "mcp_register 幂等失败(TOML 段数: ${TOML_N})"
 fi
 rm -rf "$FAKEH"
+
+# --- 31. 终端页自包含资源 + 看板去 tmux ---
+say "终端页自包含与看板措辞"
+PAGE_TMP="${TMPDIR:-/tmp}/ai-session-share-w-page.html"
+SELF_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+if [[ "$SELF_SID" == m* ]] \
+    && curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/w/${SELF_SID}" -o "$PAGE_TMP" 2>/dev/null; then
+    if grep -q "/assets/xterm.js" "$PAGE_TMP" && ! grep -q "cdn.jsdelivr" "$PAGE_TMP"; then
+        ok "终端页引用本地资源(零外部 CDN)"
+    else
+        bad "终端页仍含外部 CDN 引用"
+    fi
+    # JS 字符串字面量必须含字面反斜杠(\\n),而不是被 Python 展开的真实换行(会致 SyntaxError)
+    if grep -qF "value+'\\n'" "$PAGE_TMP"; then
+        ok "JS 转义正确(无跨行字符串字面量)"
+    else
+        bad "JS 转义异常(SyntaxError 风险)"
+    fi
+else
+    bad "终端页获取失败"
+fi
+code_asset="$(curl -s -o /dev/null -w '%{http_code}' -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/assets/xterm.js" 2>/dev/null || echo 000)"
+if [[ "$code_asset" == "200" ]]; then
+    ok "xterm 组件已本地缓存并服务"
+elif ! curl -s -m 6 -o /dev/null "https://cdn.jsdelivr.net" 2>/dev/null; then
+    say "  外网不可达,跳过组件缓存检查"
+else
+    bad "xterm 组件应 200,实际 ${code_asset}"
+fi
+if ! curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/" 2>/dev/null | grep -qi "tmux" \
+    && ! curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/state" 2>/dev/null | grep -q '"tmux"'; then
+    ok "看板与状态接口不再出现 tmux 字样"
+else
+    bad "看板/状态接口仍含 tmux"
+fi
+rm -f "$PAGE_TMP"
+python3 "$REPO/hub_server.py" api kill "$SELF_SID" >/dev/null 2>&1 || true
+
+# --- 32. 免密登录链接(?key=) + TERM 彩色输出 + fit 调用顺序/主题色 ---
+say "免密登录链接(cookie)"
+COOKIE_JAR="${TMPDIR:-/tmp}/ai-session-share-cookies.txt"
+rm -f "$COOKIE_JAR"
+code_badkey="$(curl -s -o /dev/null -w '%{http_code}' -c "$COOKIE_JAR" "http://127.0.0.1:${HUB_PORT}/?key=wrong-token-xyz" 2>/dev/null)"
+if [[ "$code_badkey" == "401" ]]; then
+    ok "错误 key 不授权(401)"
+else
+    bad "错误 key 应 401,实际 ${code_badkey}"
+fi
+rm -f "$COOKIE_JAR"
+code_goodkey="$(curl -s -o /dev/null -w '%{http_code}' -c "$COOKIE_JAR" "http://127.0.0.1:${HUB_PORT}/?key=${HUB_TOKEN}" 2>/dev/null)"
+if [[ "$code_goodkey" == "200" ]] && grep -q "ss_auth" "$COOKIE_JAR" 2>/dev/null; then
+    ok "正确 key 授权(200)并种下 cookie"
+else
+    bad "正确 key 应 200 并种 cookie,实际状态码 ${code_goodkey}"
+fi
+code_cookie_only="$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" "http://127.0.0.1:${HUB_PORT}/" 2>/dev/null)"
+if [[ "$code_cookie_only" == "200" ]]; then
+    ok "凭 cookie 免密访问(无需再传 key/账号密码)"
+else
+    bad "cookie 免密访问失败,实际 ${code_cookie_only}"
+fi
+code_nocreds="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HUB_PORT}/" 2>/dev/null)"
+if [[ "$code_nocreds" == "401" ]]; then
+    ok "无任何凭据仍拒绝(未削弱默认安全性)"
+else
+    bad "无凭据应 401,实际 ${code_nocreds}"
+fi
+rm -f "$COOKIE_JAR"
+
+say "托管会话 TERM 彩色输出与网页终端样式"
+TERM_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+if [[ "$TERM_SID" == m* ]]; then
+    sleep 0.5
+    curl -s -u "ai:${HUB_TOKEN}" -X POST -H 'Content-Type: application/json' -H 'X-Share-API: 1' \
+        -d '{"text":"echo TERM_IS_$TERM\n"}' "http://127.0.0.1:${HUB_PORT}/api/send/${TERM_SID}" >/dev/null
+    sleep 0.8
+    if curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/output/${TERM_SID}?tail=4096" \
+        | grep -q "TERM_IS_xterm-256color"; then
+        ok "托管会话默认 TERM=xterm-256color(下游 CLI 会输出彩色)"
+    else
+        bad "托管会话 TERM 未正确设置"
+    fi
+    # 关键回归:宿主环境常见的 NO_COLOR/FORCE_COLOR=0 不能被子进程原样继承,
+    # 否则遵循 no-color.org 规范的 CLI(如 claude)会整体不发颜色码,TERM 设对也没用
+    curl -s -u "ai:${HUB_TOKEN}" -X POST -H 'Content-Type: application/json' -H 'X-Share-API: 1' \
+        -d '{"text":"echo NOCOLOR=[$NO_COLOR] FORCECOLOR=[$FORCE_COLOR]\n"}' \
+        "http://127.0.0.1:${HUB_PORT}/api/send/${TERM_SID}" >/dev/null
+    sleep 0.8
+    OUT_ENV="$(curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/api/output/${TERM_SID}?tail=4096")"
+    if echo "$OUT_ENV" | grep -q "NOCOLOR=\[\] FORCECOLOR=\[1\]"; then
+        ok "宿主的 NO_COLOR 已清除、FORCE_COLOR 已强制为 1(不再被宿主环境否决颜色)"
+    else
+        bad "NO_COLOR/FORCE_COLOR 未按预期覆盖: $(echo "$OUT_ENV" | grep -o 'NOCOLOR=.*FORCECOLOR=\[[^]]*\]' | tail -1)"
+    fi
+    python3 "$REPO/hub_server.py" api kill "$TERM_SID" >/dev/null 2>&1
+else
+    bad "TERM 测试会话创建失败"
+fi
+WPAGE_TMP="${TMPDIR:-/tmp}/ai-session-share-w-fit.html"
+FIT_SID="$(python3 "$PROBE" new --cmd "bash" 2>/dev/null)"
+if [[ "$FIT_SID" == m* ]] \
+    && curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/w/${FIT_SID}" -o "$WPAGE_TMP" 2>/dev/null; then
+    OPEN_LINE="$(grep -n "term.open(document" "$WPAGE_TMP" | head -1 | cut -d: -f1)"
+    FIT_LINE="$(grep -n "fit.fit();" "$WPAGE_TMP" | head -1 | cut -d: -f1)"
+    if [[ -n "$OPEN_LINE" && -n "$FIT_LINE" && "$OPEN_LINE" -lt "$FIT_LINE" ]]; then
+        ok "xterm term.open() 在 fit() 之前调用(否则量不到容器尺寸,显示区域会很小)"
+    else
+        bad "fit 调用顺序错误(open=${OPEN_LINE:-无} fit=${FIT_LINE:-无})"
+    fi
+    if grep -q "brightGreen" "$WPAGE_TMP" && grep -q "foreground:" "$WPAGE_TMP"; then
+        ok "终端主题含完整 ANSI 配色(不再是单一白色前景)"
+    else
+        bad "终端主题缺少 ANSI 配色"
+    fi
+    python3 "$REPO/hub_server.py" api kill "$FIT_SID" >/dev/null 2>&1
+else
+    bad "fit 顺序测试会话创建失败"
+fi
+rm -f "$WPAGE_TMP"
 
 # --- 汇总 ---
 echo
