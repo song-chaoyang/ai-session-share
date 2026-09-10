@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # ai-session-share — 依赖安装脚本
-# 检测 tmux / ttyd / openssl / python3，缺失时提示或自动安装（-y）。
+# 检测 openssl / python3（必需），缺失时提示或自动安装（-y）；
+# tmux / ttyd 为旧版共享模式可选依赖，缺失仅提示。
 #
 # 用法：
 #   ./install.sh        检测并打印安装指引（不自动安装）
@@ -168,15 +169,24 @@ main() {
     os="$(detect_os)"
     log_ok "检测到平台: ${os}"
 
-    # 缺失依赖检测（命令名即包名：tmux / ttyd / openssl / python3 在各包管理器一致）
+    # 必需依赖（命令名即包名：openssl / python3 在各包管理器一致）
     local missing=()
     local cmd cmdline
 
-    for cmd in tmux ttyd openssl python3; do
+    for cmd in openssl python3; do
         if command -v "$cmd" >/dev/null 2>&1; then
             log_ok "  ${cmd}: 已安装"
         else
             missing+=("$cmd")
+        fi
+    done
+
+    # 可选依赖:tmux / ttyd 仅旧版 tmux+ttyd 共享模式使用,托管会话主流程不需要
+    for cmd in tmux ttyd; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            log_ok "  ${cmd}: 已安装（旧模式可选）"
+        else
+            log_warn "  ${cmd}: 未安装（可选,仅旧版共享模式需要;托管会话流程不需要）"
         fi
     done
 
@@ -193,9 +203,8 @@ main() {
         else
             log_ok "下一步：把入口加入 PATH 或设置别名（或运行 ./install.sh -y 自动安装 share 命令）："
             echo "  echo \"alias share='${REPO_DIR}/share.sh'\" >> ~/.zshrc && source ~/.zshrc"
-            echo "  # 然后:  share            # 一条命令共享当前会话"
-            echo "  # 或:   share here       # 在会话内一键共享当前 tmux 会话"
-            echo "  # 或:   share doctor     # 环境自检"
+            echo "  # 然后:  share new claude   # 新建托管会话并共享"
+            echo "  # 或:   share doctor        # 环境自检"
         fi
         exit 0
     fi

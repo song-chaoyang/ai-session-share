@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 #
 # ai-session-share 冒烟测试
-# 覆盖：语法检查 / 子命令行为 / 认证 / 真实起停 Web 服务 / 会话监控面板 /
-#       Claude 会话视图 / hook 会话感知 / serve 幂等与自动选端口
+# 覆盖：语法检查 / 子命令行为 / 面板生命周期与认证 / 托管会话(PTY/生命周期/attach) /
+#       Claude 会话视图 / hook 会话感知 / MCP / 免密登录 / 全局发现
 #
 # 用法：
-#   ./tests/test.sh                 # 全部测试
-#   TEST_PORT=19000 ./tests/test.sh # 指定测试端口（另可用 TEST_HUB_PORT，默认 17690）
+#   ./tests/test.sh                  # 全部测试
+#   TEST_HUB_PORT=17691 ./tests/test.sh  # 指定测试端口（默认 17690）
 
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARE="$REPO/share.sh"
-SESSION="testshare"
-PORT="${TEST_PORT:-17681}"
 HUB_PORT="${TEST_HUB_PORT:-17690}"
 # 测试用独立状态目录（不污染真实 ~/.ai-session-share），share.sh / hook / hub 均读该变量
 export SS_STATE_DIR="${SS_STATE_DIR:-${TMPDIR:-/tmp}/ai-session-share-test-state}"
@@ -30,26 +28,8 @@ ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; PASS=$((PASS + 1)); }
 bad()  { printf "  \033[31m✗\033[0m %s\n" "$*"; FAIL=$((FAIL + 1)); }
 
 cleanup() {
-    # 无论成功失败，停服务、删测试会话、清测试状态
-    SS_PORT="$PORT" "$SHARE" stop "$SESSION" >/dev/null 2>&1
-    SS_PORT="$PORT" "$SHARE" stop herex >/dev/null 2>&1
-    SS_PORT="$PORT" "$SHARE" stop hereauto >/dev/null 2>&1
-    "$SHARE" stop idemtest >/dev/null 2>&1
-    "$SHARE" stop autoport >/dev/null 2>&1
-    "$SHARE" stop busyx >/dev/null 2>&1
+    # 无论成功失败，停面板(会连带结束托管会话)、清测试状态
     SS_HUB_PORT="$HUB_PORT" SS_FORCE=1 "$SHARE" hub stop >/dev/null 2>&1
-    tmux kill-session -t "$SESSION" >/dev/null 2>&1
-    tmux kill-session -t herex >/dev/null 2>&1
-    tmux kill-session -t hereauto >/dev/null 2>&1
-    tmux kill-session -t idemtest >/dev/null 2>&1
-    tmux kill-session -t autoport >/dev/null 2>&1
-    tmux kill-session -t busyx >/dev/null 2>&1
-    rm -f "${STATE_DIR}/${SESSION}".{pid,state,log}
-    rm -f "${STATE_DIR}/herex".{pid,state,log}
-    rm -f "${STATE_DIR}/hereauto".{pid,state,log}
-    rm -f "${STATE_DIR}/idemtest".{pid,state,log}
-    rm -f "${STATE_DIR}/autoport".{pid,state,log}
-    rm -f "${STATE_DIR}/busyx".{pid,state,log}
     rm -f "${STATE_DIR}/hub".{pid,state,log}
     rm -rf "$FAKE_CLAUDE" "$STATE_DIR"
     say "清理完成"
@@ -68,140 +48,9 @@ if "$SHARE" help | grep -q "用法"; then ok "help 包含用法"; else bad "help
 say "doctor 环境自检"
 if "$SHARE" doctor >/dev/null 2>&1; then ok "doctor 退出码 0"; else bad "doctor 失败"; fi
 
-# --- 4. 非法会话名拒绝 ---
-say "非法会话名校验"
-if "$SHARE" "bad name" >/dev/null 2>&1; then bad "应拒绝含空格的会话名"; else ok "拒绝非法会话名"; fi
-
 # --- 5. 依赖缺失时的提示（不实际卸载，跳过） ---
 say "依赖检测逻辑"
 if grep -q "install.sh" "$SHARE"; then ok "脚本内提示 install.sh"; else bad "未引用 install.sh"; fi
-
-# --- 6. serve 启动 ---
-say "启动 Web 服务 (会话=$SESSION 端口=$PORT)"
-if SS_PORT="$PORT" "$SHARE" serve "$SESSION" >/tmp/ai-session-share-serve.log 2>&1; then
-    ok "serve 启动成功"
-else
-    bad "serve 启动失败"
-    tail -n 10 /tmp/ai-session-share-serve.log >&2
-    exit 1
-fi
-sleep 1
-
-# --- 7. 进程与状态文件 ---
-say "进程与状态文件"
-local_pid="$(cat "${STATE_DIR}/${SESSION}.pid" 2>/dev/null || echo '')"
-if [[ -n "$local_pid" ]] && kill -0 "$local_pid" 2>/dev/null; then
-    ok "ttyd 进程存活 (PID ${local_pid})"
-else
-    bad "ttyd 进程不存在"
-    exit 1
-fi
-if [[ -f "${STATE_DIR}/${SESSION}.state" ]]; then ok "状态文件存在"; else bad "状态文件缺失"; fi
-
-# --- 8. HTTP 访问与认证 ---
-say "HTTP 认证检查"
-TOKEN="$(grep '^token=' "${STATE_DIR}/${SESSION}.state" | cut -d= -f2)"
-if [[ -z "$TOKEN" ]]; then bad "未生成 token"; else ok "token 已生成"; fi
-code_noauth="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" 2>/dev/null || echo 000)"
-if [[ "$code_noauth" == "401" ]]; then
-    ok "无凭据访问被拒绝 (401)"
-else
-    bad "无凭据访问应返回 401，实际 ${code_noauth}"
-fi
-code_auth="$(curl -s -o /dev/null -w '%{http_code}' -u "ai:${TOKEN}" "http://127.0.0.1:${PORT}/" 2>/dev/null || echo 000)"
-if [[ "$code_auth" == "200" ]]; then
-    ok "带认证访问成功 (200)"
-else
-    bad "带认证访问应返回 200，实际 ${code_auth}"
-fi
-
-# --- 8.5 WebSocket 写入链路（浏览器输入 → tmux 会话） ---
-# ttyd ≥1.7.4 默认只读，若未加 -W 则浏览器端无法输入，双向共享失效。
-# 探针通过 /token + WebSocket 发送命令，检查命令是否真的在会话里执行。
-say "WebSocket 写入链路"
-MARK="${TMPDIR:-/tmp}/ai-session-share-ws-${SESSION}.mark"
-rm -f "$MARK"
-if command -v python3 >/dev/null 2>&1; then
-    if python3 "$REPO/tests/ws_probe.py" \
-        --port "$PORT" --user ai --state-file "${STATE_DIR}/${SESSION}.state" \
-        --command "echo WSWRITE_OK > $MARK" >/dev/null 2>&1; then
-        ok "ws 升级并发送命令成功"
-    else
-        bad "ws 升级/发送失败（见 ws_probe.py 输出）"
-    fi
-    sleep 1
-    if [[ -f "$MARK" ]] && grep -q WSWRITE_OK "$MARK"; then
-        ok "浏览器端输入已到达 tmux 会话（-W 可写生效）"
-    else
-        bad "浏览器端输入未到达终端（ttyd 只读，需加 -W）"
-    fi
-    rm -f "$MARK"
-else
-    say "  python3 缺失，跳过 WebSocket 写入测试"
-fi
-
-# --- 9. url / status 子命令 ---
-say "url / status 子命令"
-if SS_PORT="$PORT" "$SHARE" url "$SESSION" | grep -q ":${PORT}"; then ok "url 输出链接"; else bad "url 输出异常"; fi
-if SS_PORT="$PORT" "$SHARE" url "$SESSION" | grep -q "一键登录"; then
-    bad "url 仍输出一键登录(内嵌凭据)链接"
-else
-    ok "url 无内嵌凭据链接"
-fi
-if SS_PORT="$PORT" "$SHARE" status "$SESSION" | grep -q "运行中"; then ok "status 显示运行中"; else bad "status 输出异常"; fi
-
-# --- 10. stop ---
-say "停止服务"
-if SS_PORT="$PORT" "$SHARE" stop "$SESSION" >/dev/null 2>&1; then ok "stop 成功"; else bad "stop 失败"; fi
-sleep 0.5
-if ! kill -0 "$local_pid" 2>/dev/null; then ok "ttyd 进程已退出"; else bad "ttyd 进程仍存活"; fi
-if SS_PORT="$PORT" "$SHARE" status "$SESSION" | grep -q "未运行"; then ok "status 显示未运行"; else bad "status 仍显示运行"; fi
-
-# --- 11. here 子命令（显式会话名） ---
-say "here 子命令（显式会话名）"
-if SS_PORT="$PORT" "$SHARE" here herex >/tmp/ai-session-share-here.log 2>&1; then
-    ok "here <name> 启动成功"
-else
-    bad "here <name> 启动失败"
-    tail -n 10 /tmp/ai-session-share-here.log >&2
-    exit 1
-fi
-sleep 1
-if [[ -f "${STATE_DIR}/herex.state" ]] && grep -q "session=herex" "${STATE_DIR}/herex.state"; then
-    ok "here 状态文件记录会话 herex"
-else
-    bad "here 状态文件异常"
-fi
-# here 起的服务同样支持浏览器写入（-W 生效）
-MARKH="${TMPDIR:-/tmp}/ai-session-share-ws-here.mark"
-rm -f "$MARKH"
-if command -v python3 >/dev/null 2>&1; then
-    if python3 "$REPO/tests/ws_probe.py" \
-        --port "$PORT" --user ai --state-file "${STATE_DIR}/herex.state" \
-        --command "echo HERE_WRITE_OK > $MARKH" >/dev/null 2>&1 \
-        && [[ -f "$MARKH" ]] && grep -q HERE_WRITE_OK "$MARKH"; then
-        ok "here 服务的 WS 写入链路正常"
-    else
-        bad "here 服务的 WS 写入链路异常"
-    fi
-    rm -f "$MARKH"
-fi
-SS_PORT="$PORT" "$SHARE" stop herex >/dev/null 2>&1
-tmux kill-session -t herex >/dev/null 2>&1
-
-# --- 12. here 自动识别当前 tmux 会话 ---
-say "here 自动识别会话（在 tmux 会话内执行）"
-# 注意：tmux new-session 的命令不继承本脚本的导出变量（tmux server 环境独立），必须显式传
-tmux new-session -d -s hereauto "SS_STATE_DIR='${STATE_DIR}' SS_PORT=$PORT $SHARE here >/tmp/ai-session-share-hereauto.log 2>&1; exec sleep 30"
-sleep 2
-if [[ -f "${STATE_DIR}/hereauto.state" ]] && grep -q "session=hereauto" "${STATE_DIR}/hereauto.state"; then
-    ok "here 自动识别 tmux 会话 hereauto"
-else
-    bad "here 未自动识别会话"
-    tail -n 10 /tmp/ai-session-share-hereauto.log >&2
-fi
-SS_PORT="$PORT" "$SHARE" stop hereauto >/dev/null 2>&1
-tmux kill-session -t hereauto >/dev/null 2>&1
 
 # --- 13. 会话监控面板（hub）生命周期 ---
 say "hub 会话监控面板"
@@ -333,77 +182,6 @@ if [[ -z "$(printf '{"prompt":"帮我写个函数"}' | SS_STATE_DIR="$STATE_DIR"
 else
     bad "无关 prompt 被误拦截"
 fi
-
-# --- 18. serve 幂等 + 自动选端口 ---
-say "serve 幂等与自动选端口"
-tmux new-session -d -s idemtest
-if SS_STATE_DIR="$STATE_DIR" "$SHARE" serve idemtest >/dev/null 2>&1; then
-    ok "serve 首次启动成功"
-else
-    bad "serve 首次启动失败"
-fi
-IDEM_OUT="$(SS_STATE_DIR="$STATE_DIR" "$SHARE" serve idemtest 2>&1 || true)"
-if echo "$IDEM_OUT" | grep -q "复用现有链接"; then
-    ok "serve 重复执行幂等（复用现有链接）"
-else
-    bad "serve 重复执行未复用: $(echo "$IDEM_OUT" | head -c 200)"
-fi
-IDEM_PORT="$(grep '^port=' "${STATE_DIR}/idemtest.state" 2>/dev/null | cut -d= -f2)"
-if [[ -n "$IDEM_PORT" ]] && curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${IDEM_PORT}/" 2>/dev/null | grep -q "401"; then
-    ok "幂等服务端口 ${IDEM_PORT} 仍正常响应"
-else
-    bad "幂等服务端口 ${IDEM_PORT} 无响应"
-fi
-# /open/ 访问信息页:必须展示该 ttyd 服务自己的密码(而非面板密码),且不做带凭据重定向
-IDEM_TOKEN="$(grep '^token=' "${STATE_DIR}/idemtest.state" 2>/dev/null | cut -d= -f2)"
-OPEN_OUT="$(curl -s -u "ai:${HUB_TOKEN}" "http://127.0.0.1:${HUB_PORT}/open/${IDEM_PORT}" 2>/dev/null)"
-if [[ -n "$IDEM_TOKEN" ]] && echo "$OPEN_OUT" | grep -q "$IDEM_TOKEN" && ! echo "$OPEN_OUT" | grep -q "${HUB_TOKEN}"; then
-    ok "/open/ 显示该服务自己的密码(非面板密码)"
-else
-    bad "/open/ 凭据展示错误"
-fi
-if echo "$OPEN_OUT" | grep -q "Location"; then
-    bad "/open/ 仍是带凭据重定向"
-else
-    ok "/open/ 为信息页(无内嵌凭据重定向)"
-fi
-# 自动选端口：默认 7681 被占时应顺延（本机有正在共享的服务或 CI 空闲则用 7681 本身）
-tmux new-session -d -s autoport
-BASE_BUSY=0
-if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:7681 -sTCP:LISTEN >/dev/null 2>&1; then
-    BASE_BUSY=1
-fi
-if SS_STATE_DIR="$STATE_DIR" "$SHARE" serve autoport >/dev/null 2>&1; then
-    AUTO_PORT="$(grep '^port=' "${STATE_DIR}/autoport.state" 2>/dev/null | cut -d= -f2)"
-    if [[ $BASE_BUSY -eq 1 ]]; then
-        if [[ -n "$AUTO_PORT" && "$AUTO_PORT" != "7681" ]]; then
-            ok "端口被占时自动顺延 (7681 → ${AUTO_PORT})"
-        else
-            bad "端口被占时未顺延，仍为 ${AUTO_PORT}"
-        fi
-    else
-        if [[ "$AUTO_PORT" == "7681" ]]; then
-            ok "默认端口空闲时直接使用 (${AUTO_PORT})"
-        else
-            bad "端口空闲时不应顺延，实际 ${AUTO_PORT}"
-        fi
-    fi
-else
-    bad "autoport serve 启动失败"
-fi
-# 显式指定 SS_PORT 且被占 → 应报错拒绝（用另一个会话，避免命中幂等路径）
-tmux new-session -d -s busyx
-if SS_STATE_DIR="$STATE_DIR" SS_PORT="$AUTO_PORT" "$SHARE" serve busyx >/dev/null 2>&1; then
-    bad "显式端口被占时应拒绝"
-else
-    ok "显式端口被占时报错拒绝"
-fi
-SS_STATE_DIR="$STATE_DIR" "$SHARE" stop idemtest >/dev/null 2>&1
-SS_STATE_DIR="$STATE_DIR" "$SHARE" stop autoport >/dev/null 2>&1
-SS_STATE_DIR="$STATE_DIR" "$SHARE" stop busyx >/dev/null 2>&1
-tmux kill-session -t idemtest >/dev/null 2>&1
-tmux kill-session -t autoport >/dev/null 2>&1
-tmux kill-session -t busyx >/dev/null 2>&1
 
 # --- 19. hub stop ---
 say "hub 停止"

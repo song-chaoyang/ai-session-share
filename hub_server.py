@@ -6,7 +6,6 @@
   - 托管会话(自管 PTY;进程退出网页会话自动结束,双向操作)
   - Claude Code 会话列表(~/.claude/projects/**/**.jsonl,实时网页视图)
   - atomcode 会话活动(~/.atomcode/datalog/**,原始日志尾部视图)
-  - 已在共享中的 ttyd 服务清单(端口/链接)
 
 设计原则:只用 Python 标准库,无任何第三方依赖;
 Basic Auth 与 share.sh 同一套随机 token 机制(用户名 ai,密码每次启动重新生成);
@@ -112,33 +111,6 @@ def pid_alive(pid):
         return True
     except (ValueError, ProcessLookupError, PermissionError):
         return False
-
-
-def read_state_files():
-    """读取 ~/.ai-session-share/*.state → 正在共享的 ttyd 服务清单。"""
-    out = []
-    if not STATE_DIR.is_dir():
-        return out
-    for f in sorted(STATE_DIR.glob("*.state")):
-        if f.name == "hub.state":
-            continue
-        cfg = {}
-        try:
-            for line in f.read_text().splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    cfg[k] = v
-        except OSError:
-            continue
-        pid, port = cfg.get("pid", ""), cfg.get("port", "")
-        if pid and pid_alive(pid) and port:
-            out.append({
-                "session": cfg.get("session", f.stem),
-                "port": port,
-                "token": cfg.get("token", ""),
-                "url": f"/open/{port}",
-            })
-    return out
 
 
 def claude_sessions():
@@ -664,11 +636,6 @@ async function load(){
     const r = await fetch('/api/state');
     const s = await r.json();
     let h = '';
-    const sharedRow = x => `<tr><td class="mono">${x.session}</td><td class="mono">${x.port}</td>
-      <td><a href="${x.url}" target="_blank">打开终端 ↗</a></td></tr>`;
-    if(s.shared.length)
-      h += `<div class="card"><h2>📡 共享中的终端服务</h2><table>
-        <tr><th>服务</th><th>端口</th><th>链接</th></tr>${s.shared.map(sharedRow).join('')}</table></div>`;
     if(s.managed && s.managed.length){
       h += `<div class="card"><h2>🎮 托管会话 — 进程退出(如 /exit)自动结束</h2><table>
         <tr><th>会话</th><th>命令</th><th>PID</th><th>客户端</th><th>状态</th><th></th></tr>` +
@@ -869,38 +836,6 @@ def transcript_page(session_id, path):
             .replace("__CSS__", CSS)
             .replace("__SID__", html.escape(session_id, quote=True))
             .replace("__SID8__", html.escape(session_id[:8], quote=True)))
-
-
-# 共享终端访问信息页:浏览器已禁用 URL 内嵌凭据自动登录,直接展示地址与该服务自己的密码
-def open_page(port, entry, host):
-    token = entry.get("token", "")
-    url = f"http://{host}:{port}"
-    cred_rows = (
-        f'<tr><th>用户名</th><td class="mono">{AUTH_USER}</td></tr>\n'
-        f'    <tr><th>密码</th><td class="mono" id="pw">{_esc(token)}</td></tr>'
-        if token else
-        '<tr><th>认证</th><td>已关闭(直接打开即可)</td></tr>')
-    body = f"""
-<h1>🔓 共享终端 · {_esc(entry.get("session", ""))}</h1>
-<div class="card" style="max-width:600px;margin:16px auto">
-  <h2>访问信息(与面板密码不同,是本服务自己的密码)</h2>
-  <table>
-    <tr><th>地址</th><td class="mono"><a href="{_esc(url)}" target="_blank">{_esc(url)}</a></td></tr>
-    {cred_rows}
-  </table>
-  <div style="padding:12px 16px;display:flex;gap:10px;flex-wrap:wrap">
-    <a href="{_esc(url)}" target="_blank"
-       style="display:inline-block;background:#238636;color:#fff;border-radius:6px;padding:8px 20px;
-              text-decoration:none;font-size:14px">打开终端 ↗</a>
-    <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('pw').textContent)">
-       复制密码</button>
-  </div>
-  <div class="sub" style="padding:0 16px 14px;font-size:12px">
-    现代浏览器已禁用"URL 内嵌账号密码"的自动登录,打开地址后输入上面的账号密码即可。
-  </div>
-</div>
-<div style="text-align:center"><a href="/" style="color:#58a6ff">← 返回会话监控面板</a></div>"""
-    return page(f"共享终端 {entry.get('session', '')}", body)
 
 
 def atom_page(slug, path):
@@ -1158,7 +1093,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             return self.reply_json({
                 "hub": {"port": HUB_PORT},
-                "shared": read_state_files(),
                 "claude": claude_sessions(),
                 "atomcode": atomcode_sessions(),
                 "managed": MANAGED.list(),
@@ -1234,17 +1168,6 @@ class Handler(BaseHTTPRequestHandler):
             if not sess or sess.exited is not None:
                 return self.reply(200, ended_page(m.group(1)))
             return self.reply(200, terminal_page(sess.id, sess))
-
-        # /open/<port> → 共享终端访问信息页。
-        # 不能再做"带凭据重定向":现代浏览器禁用 URL 内嵌账号密码自动登录,
-        # 且 ttyd 服务的密码与面板密码不同 —— 如实展示该服务自己的地址与密码。
-        m = re.fullmatch(r"/open/(\d+)", path)
-        if m:
-            entry = next((s for s in read_state_files() if s["port"] == m.group(1)), None)
-            if not entry:
-                return self.reply(404, "404 没有运行中的共享终端服务", "text/plain; charset=utf-8")
-            host = (self.headers.get("Host") or "").split(":")[0] or lan_ip()
-            return self.reply(200, open_page(m.group(1), entry, host))
 
         # /t/<id>[/data]
         m = re.fullmatch(r"/t/([A-Za-z0-9-]+)(/data)?", path)
@@ -1509,8 +1432,6 @@ def api_cli():
             print(f"托管会话(已结束,面板仍可查看): {len(ended)} 个")
         if not mg and not ended:
             print("托管会话: 无(可 share new claude 创建)")
-        for x in d.get("shared", []):
-            print(f"共享终端: {x['session']}  端口 {x['port']}")
         cl = d.get("claude", [])
         if cl:
             live = [x for x in cl if x.get("live")]

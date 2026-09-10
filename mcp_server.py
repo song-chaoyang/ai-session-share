@@ -4,7 +4,7 @@
 一个 AI 客户端(claude / atomcode / codex / 任何 MCP 客户端)连上本服务器后,
 即可在不离开对话的情况下:
 
-  - list_sessions   列出所有活动会话(托管/Claude/atomcode/共享服务)与状态
+  - list_sessions   列出所有活动会话(托管/Claude/atomcode)与状态
   - session_status  查看单个托管会话详情(含最近输出预览)
   - spawn_session   新建托管会话(如 claude / bash),返回网页链接
   - send_input      向托管会话发送键盘输入(操作会话,与网页同一 PTY 通路)
@@ -97,11 +97,6 @@ def t_list_sessions(args):
         for x in mg:
             state = "■ 已结束" if x["exited"] else "● 运行中"
             lines.append(f"  {x['id']}  {state}  客户端 {x['clients']}  {x['cmd']}")
-    sh = s.get("shared", [])
-    if sh:
-        lines.append("共享终端服务(ttyd):")
-        for x in sh:
-            lines.append(f"  {x['session']}  端口 {x['port']}")
     cl = s.get("claude", [])
     if cl:
         live = [x for x in cl if x.get("live")]
@@ -184,7 +179,7 @@ def t_kill_session(args):
 TOOLS = [
     {
         "name": "list_sessions",
-        "description": "列出本机所有活动会话与状态:托管会话、共享终端服务、Claude Code 会话、atomcode 活动。",
+        "description": "列出本机所有活动会话与状态:托管会话、Claude Code 会话、atomcode 活动。",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {

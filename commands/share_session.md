@@ -2,7 +2,7 @@
 description: 把当前终端会话共享为局域网 Web 服务,输出访问链接与账号密码
 ---
 
-把当前终端会话共享成局域网 Web 服务,让局域网内其他人用浏览器实时查看并继续操作这个会话(与本机共用同一个 tmux 终端,上下文一致)。
+把当前终端会话共享成局域网 Web 服务,让局域网内其他人用浏览器实时查看并继续操作这个会话(与本机共用同一个终端,上下文一致;生命周期与会话进程绑定,进程退出后网页会话自动结束)。
 
 系统已安装 UserPromptSubmit hook:本命令会由 hook 在模型介入前直接执行并返回结果(不消耗推理 token)。收到本模板时:
 
@@ -10,23 +10,14 @@ description: 把当前终端会话共享为局域网 Web 服务,输出访问链�
 2. 如果没有任何 hook 输出(比如本机未安装 hook),则**直接执行**以下命令,并把输出**原样**展示给用户,不要总结、不要补充说明:
 
 ```bash
-share here || ~/.local/bin/share here
-```
-
-如果当前终端**不在 tmux 会话内**(上面的命令没有输出当前会话的链接),改为执行:
-
-```bash
 share hub start || ~/.local/bin/share hub start
 ```
 
-说明:要浏览器能**双向操作**且生命周期随会话自动结束,用托管会话(免 tmux):退出本地 AI 工具后执行
-`share new claude --resume <会话id>`;或直接 `share new claude` 开新会话。会话内执行 `/exit` 或进程退出后,网页会话自动结束。
+说明:hook 的默认行为是自动把当前 Claude 会话续为托管会话(`claude --resume`,双向网页终端);若 hook 未生效,告诉用户在 AI 工具里重新输入 `/share_session` 或手动执行 `share new claude --resume <会话id>`。
 
 需要展示给用户的信息(来自命令输出):
 
 1. 局域网访问链接(输出里的每一行 `http://IP:端口`);
 2. 浏览器登录用的用户名和密码(现代浏览器已禁用 URL 内嵌凭据自动登录,不要输出 `http://用户名:密码@IP:端口` 形式的链接,让用户手动输入一次账号密码即可)。
 
-说明:在 tmux 会话内,链接打开即可实时查看并**双向操作**当前会话;不在 tmux 内时,hook 会自动把当前 Claude 会话续为托管会话(`claude --resume`,双向网页终端);监控面板(`/` 首页)可查看所有运行中的会话,Claude Code 会话提供实时网页视图。
-
-如果命令提示找不到 `share`,告诉用户:先进入项目目录运行 `./install.sh -y` 安装。停止共享用 `share stop`(tmux 会话保留,可随时再 `share here` 恢复),停止监控面板用 `share hub stop`。
+如果命令提示找不到 `share`,告诉用户:先进入项目目录运行 `./install.sh -y` 安装。结束某个共享会话用 `share kill <托管会话id>`,停止监控面板用 `share hub stop`。

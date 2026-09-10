@@ -8,10 +8,11 @@ LLM 完全不参与,不消耗任何推理 token。
 
 会话感知(核心):输出的链接必须对应【调用它的那个会话】,绝不打印其他会话的链接:
 
-  1. 终端在 tmux 内($TMUX 存在)
-     → share here:把【当前所在的】 tmux 会话共享为可双向操作的 Web 终端;
-  2. 不在 tmux 内、但 stdin JSON 带 session_id(claude 会传)
-     → 启动会话监控面板,输出【当前 Claude 会话】的实时网页视图链接(/t/<session_id>);
+  1. AI 工具就跑在托管会话里($SS_MANAGED_ID 存在,hub 用 PTY 起的)
+     → 链接即本会话的双向终端;生命周期与会话进程绑定(/exit → 网页自动结束);
+  2. 普通终端(无论是否在 tmux 内)、stdin JSON 带 session_id(claude 会传)
+     → 自动 claude --resume 起托管会话,输出双向网页终端链接;
+       失败或 SS_HOOK_VIEW_ONLY=1 时退回只读实时视图(/t/<session_id>);
   3. 兜底 → 监控面板首页(列出所有运行中的会话,由用户自选)。
 
 未命中 /share_session 特征则空输出放行,不影响其他对话。
@@ -168,63 +169,51 @@ def build_links() -> str:
             lines.append(f"[share]   会话监控面板(所有会话): http://{ip}:{port}/")
             return "\n".join(lines)
 
-    # 分支 1:在 tmux 会话内 → 共享当前 tmux 会话(可双向操作)
-    if os.environ.get("TMUX"):
-        sh = share_sh_path()
-        rc, out = run(["bash", sh, "here"]) if sh != "share" else run(["share", "here"])
-        if rc == 0 and out.strip():
-            lines.append(out.strip())
-        else:
-            lines.append("[share] 执行 share here 失败,可手动运行: share here")
-
     # 公共:确保监控面板在运行(所有分支都需要它承载 /t/ /w/ 视图与面板)
     hub = ensure_hub()
 
-    if not os.environ.get("TMUX"):
-        # 分支 2:不在 tmux 内 → 把当前 Claude 会话继续为托管会话(claude --resume),
-        # 网页直接可操作;失败或被禁用时退回只读实时视图 /t/<sid>
-        sid = DATA.get("session_id") or DATA.get("sessionId") or ""
-        tp = DATA.get("transcript_path") or DATA.get("transcriptPath") or ""
-        orig_cwd = DATA.get("cwd") or ""
-        ip = lan_ip()
-        if sid and hub and want_claude_view(sid, tp):
-            port, token = hub["port"], hub.get("token", "")
-            base = f"http://{ip}:{port}"
-            resume_out = spawn_resume_session(sid, orig_cwd)
-            if resume_out:
-                lines.append("[share] 已把当前 Claude 会话共享为网页终端(双向可继续):")
-                # share.sh 的输出已是 [share] 风格(含托管会话 id/命令/局域网链接/密码),
-                # ANSI 已剥离,整体透传即可 —— 不做逐行前缀过滤(曾有丢行 bug)
-                lines.append(resume_out)
-                lines.append("[share]   说明: 网页是当前对话的继续分支(claude --resume),")
-                lines.append("[share]         两边可各自继续;网页里执行 /exit 即结束该共享。")
-                lines.append(f"[share]   只读实时视图(原会话): {base}/t/{sid}")
-                lines.append(f"[share]   会话监控面板(所有会话): {base}/")
-            else:
-                view = f"{base}/t/{sid}"
-                lines.append("[share] 已把当前 Claude 会话共享为网页(只读实时视图):")
-                lines.append(f"[share]   局域网访问: {view}")
-                if token:
-                    lines.append(f"[share]   浏览器登录: 用户名 ai，密码 {token}")
-                    lines.append(f"[share]   免密登录(打开即自动登录): {view}?key={token}")
-                lines.append("[share]   说明: 浏览器打开后可实时查看本会话;")
-                lines.append("[share]         页面上有\"在网页继续此会话\"按钮,点击即可转为双向终端。")
-                lines.append(f"[share]   会话监控面板(所有会话): {base}/")
-        elif hub:
-            # 分支 3 兜底:面板首页
-            port, token = hub["port"], hub.get("token", "")
-            base = f"http://{ip}:{port}"
-            lines.append("[share] 当前终端不在托管会话内,已打开会话监控面板(可选任意会话查看):")
-            lines.append(f"[share]   面板地址: {base}/")
+    # 分支 2(非托管会话):把当前 Claude 会话继续为托管会话(claude --resume),
+    # 网页直接可操作;失败或被禁用时退回只读实时视图 /t/<sid>。
+    # 不区分当前终端是否在 tmux 里 —— 托管会话由 hub 自己起 PTY,与外层无关;
+    # 在 tmux 里运行的 Claude 同样走 resume(网页与本地是同对话的两个分支)。
+    sid = DATA.get("session_id") or DATA.get("sessionId") or ""
+    tp = DATA.get("transcript_path") or DATA.get("transcriptPath") or ""
+    orig_cwd = DATA.get("cwd") or ""
+    ip = lan_ip()
+    if sid and hub and want_claude_view(sid, tp):
+        port, token = hub["port"], hub.get("token", "")
+        base = f"http://{ip}:{port}"
+        resume_out = spawn_resume_session(sid, orig_cwd)
+        if resume_out:
+            lines.append("[share] 已把当前 Claude 会话共享为网页终端(双向可继续):")
+            # share.sh 的输出已是 [share] 风格(含托管会话 id/命令/局域网链接/密码),
+            # ANSI 已剥离,整体透传即可 —— 不做逐行前缀过滤(曾有丢行 bug)
+            lines.append(resume_out)
+            lines.append("[share]   说明: 网页是当前对话的继续分支(claude --resume),")
+            lines.append("[share]         两边可各自继续;网页里执行 /exit 即结束该共享。")
+            lines.append(f"[share]   只读实时视图(原会话): {base}/t/{sid}")
+            lines.append(f"[share]   会话监控面板(所有会话): {base}/")
+        else:
+            view = f"{base}/t/{sid}"
+            lines.append("[share] 已把当前 Claude 会话共享为网页(只读实时视图):")
+            lines.append(f"[share]   局域网访问: {view}")
             if token:
                 lines.append(f"[share]   浏览器登录: 用户名 ai，密码 {token}")
-                lines.append(f"[share]   免密登录(打开即自动登录): {base}/?key={token}")
-        else:
-            lines.append("[share] 会话监控面板启动失败,请确认已运行 ./install.sh -y 安装依赖(python3)")
+                lines.append(f"[share]   免密登录(打开即自动登录): {view}?key={token}")
+            lines.append("[share]   说明: 浏览器打开后可实时查看本会话;")
+            lines.append("[share]         页面上有\"在网页继续此会话\"按钮,点击即可转为双向终端。")
+            lines.append(f"[share]   会话监控面板(所有会话): {base}/")
     elif hub:
-        # tmux 分支附加:面板链接
-        ip = lan_ip()
-        lines.append(f"[share] 会话监控面板(所有会话): http://{ip}:{hub['port']}/")
+        # 分支 3 兜底:面板首页
+        port, token = hub["port"], hub.get("token", "")
+        base = f"http://{ip}:{port}"
+        lines.append("[share] 已打开会话监控面板(可选任意会话查看):")
+        lines.append(f"[share]   面板地址: {base}/")
+        if token:
+            lines.append(f"[share]   浏览器登录: 用户名 ai，密码 {token}")
+            lines.append(f"[share]   免密登录(打开即自动登录): {base}/?key={token}")
+    else:
+        lines.append("[share] 会话监控面板启动失败,请确认已运行 ./install.sh -y 安装依赖(python3)")
 
     return "\n".join(lines)
 

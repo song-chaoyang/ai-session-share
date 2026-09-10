@@ -8,11 +8,11 @@
 [English documentation](README.en.md)
 
 ```bash
-./install.sh -y      # 一次性安装依赖 (tmux / ttyd / openssl / python3)
-./share.sh           # 一条命令:起服务 → 打印链接 → 进入会话
+./install.sh -y      # 一次性安装依赖 (openssl / python3)
+share new claude     # 新建托管会话:本机进入 + 打印局域网链接;网页可直接继续操作
 ```
 
-浏览器打开 `http://<局域网IP>:7681`,输入终端里打印的账号密码,即可看到并操作你当前正在跑的会话。
+浏览器打开输出的链接(如 `http://<局域网IP>:7690/w/<会话id>`),首次输入打印的账号密码,即可看到并操作你当前正在跑的会话。
 注意:现代浏览器已**禁用"URL 内嵌账号密码"自动登录**,手动输入一次账号密码即可,浏览器会记住,之后访问免输。
 
 ---
@@ -32,12 +32,12 @@
 
 | 功能 | 说明 |
 |---|---|
-| 一条命令局域网共享 | `./share.sh` / `share here`:局域网内任意浏览器实时打开你的终端 |
+| 一条命令局域网共享 | `share new`:局域网内任意浏览器实时打开你的终端 |
 | 天生双向 | 浏览器用户与本地共享**同一个 PTY**,能操作而不只是观看 |
 | 零 token 的 `/share_session` | 在 atomcode / claude / codex 里输入斜杠命令 → **模型介入前**直接返回链接(实测 `total_tokens: 0`) |
 | 会话感知输出 | 链接永远对应你调用它的那个会话,绝不打印无关会话 |
-| 托管会话 | `share new` — 面板自管 PTY,无需 tmux;进程退出(如 `/exit`)**自动结束**网页会话 |
-| 会话监控面板 | `share hub start`(默认端口 7690):监控托管 / Claude Code / atomcode / ttyd 会话 |
+| 托管会话 | `share new` — 面板自管 PTY;进程退出(如 `/exit`)**自动结束**网页会话 |
+| 会话监控面板 | `share hub start`(默认端口 7690):监控托管 / Claude Code / atomcode 会话 |
 | 网页端继续会话 | 一键"🔄 在网页继续此会话"把只读视图升级为双向终端(`claude --resume`) |
 | MCP 服务器 | 任何 MCP 客户端可直接 `list_sessions` / `spawn_session` / `send_input` / `read_output` / `kill_session` |
 | 终端页自包含 | xterm.js 自托管(零外部 CDN),Tracking Prevention / 内网隔离都弄不坏终端页 |
@@ -52,22 +52,14 @@
 #    零 token hook、MCP 注册与 SS_HUB_URL 环境变量
 ./install.sh -y
 
-# 2. 一条命令:创建/复用 tmux 会话 → 起 Web 服务 → 打印局域网链接 → 进入会话
-./share.sh
+# 2. 一条命令:新建托管会话 → 本机进入 → 打印局域网链接 → 网页继续操作
+share new claude
 
-# 3. 在会话里运行你的 AI 工具(atomcode / claude / 任意命令)——会话即被共享
-# 4. 浏览器(电脑/手机均可)访问输出的链接,输入打印的账号密码一次,即可继续操作同一会话
+# 3. 浏览器(电脑/手机均可)打开输出的链接,输入一次账号密码,即可双向操作同一会话
+#    会话里执行 /exit 或进程退出后,网页会话自动结束(无需 stop)
 ```
 
-如果已经在 tmux 会话里干活了(比如 AI 工具正在跑),**直接在会话里**执行:
-
-```bash
-share here        # 自动识别"当前所在的" tmux 会话并起服务
-share stop        # 停止 Web 服务(tmux 会话保留,可随时 share here 恢复)
-```
-
-> `./install.sh -y` 会把入口安装为 `share` 命令(`~/.local/bin/share`),之后在任意目录、任意 tmux 会话内都能
-> 直接 `share here` 共享当前会话,无需另开终端、无需记会话名。若未安装 share 命令,等价写法是 `./share.sh here`。
+> `./install.sh -y` 会把入口安装为 `share` 命令(`~/.local/bin/share`),之后在任意目录都能直接使用。
 
 ### 在 AI 工具里直接 `/share_session`(零 token)
 
@@ -87,31 +79,31 @@ hook 在**模型介入前**直接执行共享命令,并把链接通过 `{"decisi
 输出是**会话感知**的——永远对应你调用它的那个会话,不会打印无关会话的链接:
 
 - 在**托管会话**(`share new`)内运行 → 输出该会话的双向终端链接,随进程结束而结束;
-- 在 **tmux 会话内**运行 → 链接打开的就是当前 tmux 会话,**双向可操作**;
-- 在**普通终端**(未用 tmux)运行 Claude → hook 会用 `claude --resume <会话id>` **自动把该会话续为托管会话**,
+- 在**普通终端**运行 Claude → hook 会用 `claude --resume <会话id>` **自动把该会话续为托管会话**,
   链接打开的是延续同一对话的**双向网页终端**;若启动失败(或设 `SS_HOOK_VIEW_ONLY=1`)则退回该会话的
   **只读实时视图**(`/t/<会话id>`,页面上有"🔄 在网页继续此会话"按钮,点击即转为双向终端);
 - 其他情况 → 会话监控面板首页(列出所有运行中的会话)。
 
 背后由本机常驻的**会话监控面板**(`share hub start`,默认端口 7690)支撑:持续监控所有运行中的会话——托管会话、
-Claude Code 会话、atomcode 活动、在跑的 ttyd 服务——并承载上述实时视图。
+Claude Code 会话、atomcode 活动——并承载上述实时视图。
 
 例如在 atomcode 里输入 `/share_session`,会直接看到:
 
 ```
-局域网访问: http://192.168.1.100:7681
+局域网访问: http://192.168.1.100:7690/w/<会话id>
 浏览器登录: 用户名 ai，密码 <随机token>
+免密登录: http://192.168.1.100:7690/w/<会话id>?key=<随机token>
 ```
 
-浏览器打开,输入一次账号密码,即可继续操作**同一个**会话。停止共享用 `/share stop` 或 `share stop`。
+浏览器打开,输入一次账号密码,即可继续操作**同一个**会话(30 天 cookie,之后免输)。
 重新运行 `./install.sh -y` 即可为后来安装的工具补装命令与 hook;若某工具未注册 hook(比如手动删除过配置),
 命令模板仍会提示 AI 直接执行并原样展示输出。
 
 ---
 
-## 托管会话(生命周期绑定,无需 tmux)
+## 托管会话(生命周期绑定)
 
-`share new` 把命令(如 `claude`)跑在**面板自管的 PTY** 里——无需多路复用器与额外守护进程:
+`share new` 把命令(如 `claude`)跑在**面板自管的 PTY** 里——由面板进程直接 fork 并持有,无需多路复用器与额外守护进程:
 
 ```bash
 share new claude          # 启动 Claude → 本机进入 → 打印局域网链接
@@ -137,7 +129,7 @@ AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在
 
 | 工具 | 作用 |
 |------|------|
-| `list_sessions` | 列出所有活动会话与状态(托管 / ttyd / Claude / atomcode) |
+| `list_sessions` | 列出所有活动会话与状态(托管 / Claude / atomcode) |
 | `session_status` | 单个托管会话详情:命令 / PID / 连接 / 链接 / 输出预览 |
 | `spawn_session` | 新建托管会话(如 `claude`)并返回网页链接 |
 | `send_input` | 向会话发送键盘输入(与网页/本机同一条 PTY) |
@@ -160,8 +152,7 @@ AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在
 - **Claude Code 会话** — 监控 `~/.claude/projects/**/**.jsonl` 会话文件与活跃状态,提供自动刷新的只读网页视图
   (`/t/<会话id>`),按对话气泡渲染、含工具调用,并有"🔄 在网页继续此会话"按钮——一键以 `claude --resume`
   起成双向托管终端;
-- **atomcode 活动** — 各项目最新日志与原始尾部视图;
-- **共享中的 ttyd 服务** — 所有在跑的共享及其端口与链接。
+- **atomcode 活动** — 各项目最新日志与原始尾部视图。
 
 面板与其视图使用与终端共享相同的 Basic Auth(用户名 `ai` + 随机 token)。
 
@@ -180,14 +171,11 @@ AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在
 │  │ Claude Code 会话监控                    │◄─┼───┤ /t/<claude-id>   │
 │  │  ~/.claude/projects/**/*.jsonl         │  │   │ 只读视图          │
 │  ├───────────────────────────────────────┤  │   │ (+继续会话按钮)    │
-│  │ atomcode 活动 / ttyd 服务清单           │  │   │                  │
+│  │ atomcode 活动                            │  │   │                  │
 │  │ xterm.js 组件(自托管)                  │  │   │ 仪表盘 /(5s 刷新)  │
 │  └───────────────────────────────────────┘  │   └──────────────────┘
 │        ▲ fork 并监控                         │
-│  ┌─────┴────────────────────────────────┐   │
-│  │ share.sh 入口:ttyd 服务(7681)          │   │   浏览器直连 ttyd
-│  │  tmux 会话共享(旧模式)                 │◄──┼───►  WebSocket 双向
-│  └──────────────────────────────────────┘   │
+│  share.sh 入口:new/attach/kill/sessions/hub   │
 │  hooks/install_hooks.py  /share_session(零 token,会话感知)
 │  mcp_register.py → MCP 客户端(claude/atomcode/codex)
 └─────────────────────────────────────────────┘
@@ -204,13 +192,13 @@ AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在
 **流程 1 — 一条命令 / 零 token 共享:**
 
 ```
-输入 /share_session(或运行 share here)
+输入 /share_session(或运行 share new)
    │
    ▼
 UserPromptSubmit hook 在模型介入前触发(atomcode/claude/codex)
-   │  执行: share here | share new --resume | hub start
+   │  执行: share new claude --resume <sid> | hub start
    ▼
-share.sh 解析会话与端口 → 启动 ttyd(7681)或面板托管 PTY
+share.sh → 面板 fork 命令到托管 PTY → /w/<id>
    │
    ▼
 打印:局域网链接 + 用户名 ai + 随机密码(无内嵌凭据链接)
@@ -219,10 +207,10 @@ share.sh 解析会话与端口 → 启动 ttyd(7681)或面板托管 PTY
 同事浏览器打开链接 → 输入一次账号密码
    │
    ▼
-浏览器与本地终端共享同一 PTY/tmux → 双向继续
+浏览器与本地终端共享同一 PTY → 双向继续
 ```
 
-**流程 2 — 普通终端里的 Claude(无 tmux)获得双向网页会话:**
+**流程 2 — 普通终端里的 Claude 获得双向网页会话:**
 
 ```
 在普通终端 Claude 里输入 /share_session
@@ -257,35 +245,26 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
 
 | 命令 | 作用 |
 |------|------|
-| `./share.sh` / `./share.sh start [name]` | 一条命令:确保 tmux 会话 → 起 Web 服务 → 打印链接 → 进入会话(默认会话名 `ai`) |
-| `./share.sh serve [name]` | 只起 Web 服务,共享一个已有 tmux 会话(适合已在会话里干活时另开终端调用) |
-| `./share.sh here [name]` | **会话内一键共享**:自动识别当前所在的 tmux 会话并起服务 |
-| `./share.sh stop [name]` | 停止 Web 服务;tmux 会话保留 |
-| `./share.sh status [name]` | 查看服务/会话状态与认证信息 |
-| `./share.sh url [name]` | 重新打印访问链接与账号密码 |
-| `./share.sh new [--no-attach] <命令...>` | 托管会话(面板 PTY,无需 tmux):起服务 → 打印链接 →(进入) |
-| `./share.sh attach <id>` | 本机终端再次连接到托管会话 |
-| `./share.sh kill <id>` | 强制结束托管会话 |
-| `./share.sh hub [action]` | 会话监控面板:`start`/`stop`/`status`/`url`(默认 `start`,端口 7690) |
-| `./share.sh sessions` | 全局查看所有活动中的会话与状态(托管 / ttyd / Claude / atomcode) |
-| `./share.sh doctor` | 环境自检(依赖/端口/局域网 IP) |
-| `./share.sh help` | 帮助 |
+| `share new [--no-attach] [--cwd <目录>] <命令...>` | 新建托管会话(面板 PTY):起服务 → 打印链接 →(进入) |
+| `share attach <id>` | 本机终端再次连接到托管会话(关闭终端不会结束会话) |
+| `share kill <id>` | 强制结束托管会话(进程组 TERM→KILL 升级) |
+| `share status` / `share url` | 查看面板状态与认证信息 / 重新打印访问链接 |
+| `share hub [action]` | 会话监控面板:`start`/`stop`/`status`/`url`(默认 `start`,端口 7690) |
+| `share sessions` | 全局查看所有活动中的会话与状态(托管 / Claude / atomcode) |
+| `share doctor` | 环境自检(依赖/端口/局域网 IP) |
+| `share help` | 帮助 |
 
 ## 配置(环境变量)
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `SS_SESSION` | `ai` | 默认 tmux 会话名 |
-| `SS_PORT` | `7681` | 服务端口(显式指定被占时报错;未指定且被占时自动顺延 7682/7683…) |
-| `SS_HOST` | `0.0.0.0` | 监听地址(一般不用改) |
 | `SS_HUB_PORT` | `7690` | 会话监控面板端口 |
 | `SS_HUB_URL` | install.sh 自动写入 shell rc | 全局面板地址(`http://127.0.0.1:7690`)——任意终端/AI 客户端据此发现监控面板 |
 | `SS_HUB_TOKEN` | — | 面板认证 token 的环境变量兜底(hub.state 不可用时) |
 | `SS_STATE_DIR` | `~/.ai-session-share` | 状态目录(share.sh/hook/hub 共用);创建时设为 `0700` 权限 |
 | `SS_NO_AUTH` | 空 | 设 `1` 关闭登录认证(**不推荐**) |
 
-状态文件位于 `~/.ai-session-share/`(本机自用,`0700`,不入库):`<session>.pid` / `<session>.state` /
-`<session>.log`,面板另有 `hub.pid` / `hub.state` / `hub.log` 与缓存的 `/assets/`。
+状态文件位于 `~/.ai-session-share/`(本机自用,`0700`,不入库):`hub.pid` / `hub.state` / `hub.log` 与缓存的 `/assets/`(终端组件)。
 
 ---
 
@@ -293,18 +272,17 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
 
 **链接 + 密码 = 你机器的钥匙。** 拿到凭证的任何人可以在你的终端里执行任意命令(等同你本人在操作)。
 
-- 默认开启 Basic Auth:每次 `start/serve/here` 生成**随机 token** 作为密码(用户名固定 `ai`),密码会打印在终端里,
+- 默认开启 Basic Auth:面板启动生成**随机 token** 作为密码(用户名固定 `ai`),密码会打印在终端里,
   浏览器访问时输入即可;
-- 建议仅在企业内网 / 家庭可信网络使用;用完执行 `./share.sh stop`;
+- 建议仅在企业内网 / 家庭可信网络使用;用完执行 `share hub stop`(有存活托管会话时会拒绝,防误停);
 - 不要用 `SS_NO_AUTH=1`(仅限完全可信网络且你清楚后果);
-- **不要**把端口 7681/7690 转发到公网(frp / 路由器端口映射 / ngrok),等于把终端与 AI 会话内容公开;
+- **不要**把端口 7690 转发到公网(frp / 路由器端口映射 / ngrok),等于把终端与 AI 会话内容公开;
 - token 存于 `~/.ai-session-share/*.state`(目录权限 `0700`),勿分享该目录;
 - **现代浏览器已禁用 URL 内嵌账号密码自动登录**(`http://ai:密码@IP:端口` 不再生效),工具因此从不打印此类链接——
   在浏览器登录框输入一次账号密码,浏览器会按站点记住,之后访问免输;
 - **免密登录链接**(面板/托管会话/实时视图页支持):`http://IP:端口/路径?key=密码`,打开即自动登录并写入 30 天
   cookie,之后刷新/跳转都不用再输密码。原理是普通查询参数(不是被浏览器拦截的"URL 内嵌凭据"),但**分享这个
-  链接等于分享密码**,请像对待密码一样对待它,仅在可信网络内使用。旧式 ttyd(`/open/<port>`)不支持此机制,
-  仍需手动输入该服务自己的账号密码。
+  链接等于分享密码**,请像对待密码一样对待它,仅在可信网络内使用。
 
 ---
 
@@ -340,20 +318,20 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
 **多人同时输入会怎样?** 所有人共享同一个终端,输入会互相竞争(和 tmate 多人协作一样)。适合"一人主导、他人旁观/
 补充"的场景;浏览器端默认看到的就是当前实时画面。
 
-**手机能访问吗?** 可以。ttyd 内置 xterm.js,触屏虚拟键盘可用,适合手机跟进长任务。
+**手机能访问吗?** 可以。网页终端用的就是 xterm.js,触屏虚拟键盘可用,适合手机跟进长任务。
 
 **想只读观看(不让对方操作)?** 本仓库是双向共享。只读场景可用 `tmate`(自带 read-only 链接),或把 token 只发给
 可信的人。
 
-**不在 tmux 里跑 Claude,/share_session 给我什么?** hook 会用 `claude --resume <会话id>` **自动把该会话续为托管
+**在普通终端跑 Claude,/share_session 给我什么?** hook 会用 `claude --resume <会话id>` **自动把该会话续为托管
 会话**(由面板拉起),链接打开的是延续同一对话的**双向网页终端**——浏览器可直接输入,续跑进程退出后共享自动结束。
 若自动拉起失败(或设 `SS_HOOK_VIEW_ONLY=1`),仍会得到该会话的**只读实时视图**(`/t/<id>`,2s 刷新),页面上的
 "🔄 在网页继续此会话"按钮可随时一键转为双向终端。
 
-**退出 tmux / 关终端会影响服务吗?** 不会。ttyd 是独立后台进程,`stop` 才关闭;会话数据在 tmux 里,随时
-`tmux attach -t ai` 回来。
+**关闭终端会影响服务吗?** 不会。托管会话由面板进程托管,关闭本地终端只是断开连接;浏览器继续操作不受影响。
+需要强制结束某个会话用 `share kill <id>`;停止面板(会一并结束全部托管会话)用 `share hub stop`。
 
-**端口被占用怎么办?** `SS_PORT=9000 ./share.sh`(`doctor` 会先检查端口占用)。
+**端口被占用怎么办?** `SS_HUB_PORT=7691 share hub start`(`doctor` 会先检查端口占用)。
 
 **浏览器提示密码错误/登录不上?** 服务端认证链路是正常的(无凭据必返回 401)。常见原因是:
 1. **服务重启后密码变了**——每次 `start/serve/here` 都会重新生成 token,浏览器常缓存旧密码;请换**无痕窗口**,
@@ -362,26 +340,28 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
    一次账号密码,浏览器会按站点记住,之后访问免输;随时可用 `./share.sh url` 重新打印当前密码;
 3. 确认访问的是终端里打印的局域网 IP(同一 Wi-Fi 下),手机用流量访问会打不开。
 
-**没有 tmux/ttyd 怎么办?** `./install.sh -y`(macOS 走 brew,Linux 走 apt/dnf/yum)。Windows 用户可用 WSL。
+**需要哪些依赖?** 只有 openssl 与 python3(`./install.sh -y` 自动安装;macOS 走 brew,Linux 走 apt/dnf/yum)。
+Windows 用户可用 WSL。
 
-**浏览器端中文乱码?** ttyd 支持 CJK;若本地 locale 非 UTF-8,先在会话里 `export LANG=en_US.UTF-8`。
+**浏览器端中文乱码?** 托管会话强制 `TERM=xterm-256color` 并清除 NO_COLOR,正常情况中文与彩色都没问题;
+若仍异常,检查宿主环境是否注入了 NO_COLOR。
 
 ---
 
 ## 开发 / 测试
 
 ```bash
-bash -n share.sh install.sh                          # shell 语法检查
-python3 -m py_compile hub_server.py hooks/*.py       # python 语法检查
-./share.sh doctor                                    # 环境自检
-tests/test.sh                                        # 完整冒烟测试:依赖/子命令/真实起停/面板/hook/
-                                                     # WS 写入链路/MCP/端口(79 项检查)
+bash -n share.sh install.sh tests/test.sh             # shell 语法检查
+python3 -m py_compile hub_server.py hooks/*.py mcp_server.py hub_attach.py  # python 语法检查
+./share.sh doctor                                     # 环境自检
+tests/test.sh                                          # 完整冒烟测试:面板生命周期/托管会话/hook/
+                                                        # MCP/免密登录/彩色输出(62 项检查)
 ```
 
-架构:`share.sh`(入口+全部逻辑)→ 依赖 `tmux`(旧模式)、`ttyd`(WebSocket 终端)、`openssl`(token)、`python3`
-(hub/MCP);`install.sh`(跨平台依赖安装);`hub_server.py`(面板 + 托管 PTY + 程序化 API,纯标准库);
-`hub_attach.py`(本机连接客户端);`mcp_server.py`(多 AI 客户端 MCP 服务器);
+架构:`share.sh`(入口+CLI)→ `hub_server.py`(面板 + 托管 PTY + 程序化 API,纯标准库);
+`hub_attach.py`(本机连接客户端);`mcp_server.py`(多 AI 客户端 MCP 服务器);`install.sh`(跨平台依赖安装);
 `commands/share_session.md`(斜杠命令模板)+ `hooks/`(零 token 会话感知 UserPromptSubmit hook)。
+依赖只有 `openssl`(token)与 `python3`;纯 Python 自管 PTY,不需要 tmux/ttyd。
 
 ---
 
