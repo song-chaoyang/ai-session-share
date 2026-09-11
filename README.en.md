@@ -153,6 +153,34 @@ The dashboard endpoint is globally discoverable via the `SS_HUB_URL` environment
 it to your shell rc); `SS_HUB_TOKEN` provides the auth fallback. `share sessions` prints the same global view in
 the terminal.
 
+### Cross-device collaboration · one AI orchestrating many AIs on many machines
+
+The hub itself listens on `0.0.0.0` behind Basic Auth, i.e. it is LAN-reachable — and **the MCP server supports
+pointing at another device's hub**: when `SS_HUB_URL` points to a non-local host (e.g.
+`http://192.168.1.100:7690`), every MCP tool (spawn/send/read/kill/list) drives **that device's** managed
+sessions; the auth token comes from `SS_HUB_TOKEN` (the other device's token, already passed through
+automatically by `./install.sh -y` when it registers the MCP server). A "one orchestrator, many workers across
+machines" setup can therefore be composed directly with MCP:
+
+```
+Orchestrator AI on host A (MCP client)
+  │
+  ├─ spawn_session("claude")          → local sidA
+  ├─ set SS_HUB_URL=http://<peer-IP>:7690 + SS_HUB_TOKEN=<peer token>
+  ├─ spawn_session("claude")          → peer device's sidB
+  ├─ send_input(sidA, "handle subtask A…\r")
+  ├─ send_input(sidB, "handle subtask B…\r")
+  ├─ read_output(sidA / sidB)         → poll for results
+  └─ kill_session(...)                → cleanup
+```
+
+- Each session is an **independent PTY on an independent device** — no key contention; the context that is truly
+  shared is the **project files** (git branches / sync), which is exactly what "collaboratively finish one task"
+  needs.
+- Boundary: there is no event push yet (poll `read_output`), and no built-in task orchestration / file locking —
+  that is the Phase 1/2 direction (task store + event bus + file leases). Today, "one orchestrator, many workers"
+  execution and collection already work end to end.
+
 ---
 
 ## Session hub · dashboard
@@ -276,7 +304,7 @@ reader thread sees EOF → session ended → web page shows "会话已结束"
 |----------|---------|-------------|
 | `SS_HUB_PORT` | `7690` | Dashboard port |
 | `SS_HUB_URL` | added to shell rc by install.sh | Global hub endpoint (`http://127.0.0.1:7690`) — any terminal / AI client discovers the dashboard via it |
-| `SS_HUB_TOKEN` | — | Hub auth token via env (fallback when `hub.state` is unavailable) |
+| `SS_HUB_TOKEN` | — | Hub auth token via env (fallback when `hub.state` is unavailable); for **cross-device collaboration** set it to the *peer device's* token (paired with `SS_HUB_URL` pointing at the peer — see the MCP section) |
 | `SS_STATE_DIR` | `~/.ai-session-share` | State directory (shared by share.sh / hook / hub); created with `0700` perms |
 | `SS_NO_AUTH` | empty | Set `1` to disable login auth (**not recommended**) |
 

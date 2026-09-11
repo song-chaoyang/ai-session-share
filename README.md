@@ -142,6 +142,30 @@ AI 客户端(claude / atomcode / codex)。之后在任意客户端里**直接在
 面板端点通过 `SS_HUB_URL` 环境变量全局可发现(`./install.sh -y` 自动写入 shell rc);`SS_HUB_TOKEN` 提供认证兜底。
 `share sessions` 在终端里输出同样的全局会话视图。
 
+### 跨设备协同 · 一台 AI 指挥多台设备上的多个 AI
+
+面板(hub)本身就监听 `0.0.0.0` 并带 Basic Auth,对局域网开放——**MCP 服务器支持指向远端设备的面板**:当
+`SS_HUB_URL` 指向非本机 host(如 `http://192.168.1.100:7690`)时,MCP 的所有工具(spawn/send/read/kill/list)
+都会驱动**那台设备**上的托管会话;认证 token 用 `SS_HUB_TOKEN`(对端设备的 token,`./install.sh -y` 注册 MCP
+时已自动透传)。于是"一主多从"的跨设备协同可以直接用 MCP 拼出来:
+
+```
+主机上的主 AI(MCP 客户端)
+  │
+  ├─ spawn_session("claude")          → 本机 sidA
+  ├─ 设 SS_HUB_URL=http://<对端IP>:7690 + SS_HUB_TOKEN=<对端token>
+  ├─ spawn_session("claude")          → 对端设备 sidB
+  ├─ send_input(sidA, "负责子任务 A…\r")
+  ├─ send_input(sidB, "负责子任务 B…\r")
+  ├─ read_output(sidA / sidB)         → 轮询收集结果
+  └─ kill_session(...)                → 收尾
+```
+
+- 每个会话是**独立 PTY、独立设备**,彼此不抢键;真正共享的上下文是**项目文件**(git 分支/同步),这正是协同完成
+  一个任务需要的。
+- 边界:目前没有事件推送(需轮询 `read_output`)、没有内建任务编排/文件锁——这是 Phase 1/2 的方向
+  (任务库 + 事件总线 + 文件租约);当前已能跑通"一主多从"的执行与收集。
+
 ---
 
 ## 会话监控面板(hub)
@@ -260,7 +284,7 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
 |------|------|------|
 | `SS_HUB_PORT` | `7690` | 会话监控面板端口 |
 | `SS_HUB_URL` | install.sh 自动写入 shell rc | 全局面板地址(`http://127.0.0.1:7690`)——任意终端/AI 客户端据此发现监控面板 |
-| `SS_HUB_TOKEN` | — | 面板认证 token 的环境变量兜底(hub.state 不可用时) |
+| `SS_HUB_TOKEN` | — | 面板认证 token 的环境变量兜底(hub.state 不可用时);**跨设备协同时**填对端设备的 token(配 `SS_HUB_URL` 指向对端,见 MCP 一节) |
 | `SS_STATE_DIR` | `~/.ai-session-share` | 状态目录(share.sh/hook/hub 共用);创建时设为 `0700` 权限 |
 | `SS_NO_AUTH` | 空 | 设 `1` 关闭登录认证(**不推荐**) |
 

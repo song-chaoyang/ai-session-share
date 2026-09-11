@@ -58,13 +58,33 @@ def save_json(path, data):
     tmp.replace(path)
 
 
-def mcp_entry():
+def _hub_env():
+    """MCP 服务器的 env:SS_HUB_URL(面板地址)+ SS_HUB_TOKEN(面板 token,跨设备/兜底认证用)。
+
+    token 取环境变量 SS_HUB_TOKEN;未设时从本地 hub.state 读取当前面板 token,
+    使注册后的 MCP 在本机可用、跨设备时(远端 hub 用对端 token)也只需改 SS_HUB_URL。
+    """
     env = {"SS_HUB_URL": os.environ.get("SS_HUB_URL", "http://127.0.0.1:7690")}
+    token = os.environ.get("SS_HUB_TOKEN", "")
+    if not token:
+        try:
+            for line in (Path.home() / ".ai-session-share" / "hub.state").read_text(encoding="utf-8").splitlines():
+                if line.startswith("token="):
+                    token = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    if token:
+        env["SS_HUB_TOKEN"] = token
+    return env
+
+
+def mcp_entry():
     return {
         "type": "stdio",
         "command": sys.executable or "python3",
         "args": [str(MCP_PY)],
-        "env": env,
+        "env": _hub_env(),
     }
 
 
@@ -109,7 +129,7 @@ def register_toml(cfg_path):
         header,
         f'command = "{entry["command"]}"',
         f'args = ["{entry["args"][0]}"]',
-        f'env = {{ SS_HUB_URL = "{entry["env"]["SS_HUB_URL"]}" }}',
+        'env = { ' + ", ".join(f'{k} = "{v}"' for k, v in entry["env"].items()) + " }",
     ]
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text("\n".join(out + block) + "\n", encoding="utf-8")

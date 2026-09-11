@@ -35,9 +35,19 @@ SERVER_NAME = "ai-session-share"
 SERVER_VERSION = "1.0.0"
 PROTOCOL_VERSION = "2024-11-05"
 
+# SS_HUB_URL 指向这些 host 视为"本机面板"(用 hub.state 的端口/token);
+# 指向其他 host 视为"远端设备面板"(跨设备协同),token 用 SS_HUB_TOKEN。
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
 
 def load_hub():
-    """返回 (port, token);hub.state 优先,SS_HUB_URL/SS_HUB_TOKEN 兜底。"""
+    """返回 (host, port, token)。
+
+    - 本机(未设 SS_HUB_URL,或指向 127.0.0.1):host=127.0.0.1,端口/token 优先
+      读 hub.state,缺失时用 SS_HUB_URL/SS_HUB_TOKEN 兜底;
+    - 跨设备(SS_HUB_URL 指向非本机 host):直接采用该 host:port,
+      token 用 SS_HUB_TOKEN(远端设备的 token,需通过 mcp_register 透传或 shell rc 设置)。
+    """
     cfg = {}
     try:
         for line in (STATE_DIR / "hub.state").read_text().splitlines():
@@ -46,23 +56,26 @@ def load_hub():
                 cfg[k] = v
     except OSError:
         pass
+    m = re.match(r"https?://([^:/]+)(?::(\d+))?", os.environ.get("SS_HUB_URL", "").rstrip("/"))
+    url_host, url_port = (m.group(1), m.group(2)) if m else ("", "")
+    if url_host and url_host not in _LOCAL_HOSTS:
+        # 远端设备面板:本机 hub.state 的 token 对远端无效,只用环境变量
+        return url_host, url_port or cfg.get("port", ""), os.environ.get("SS_HUB_TOKEN", "")
     port, token = cfg.get("port", ""), cfg.get("token", "")
-    if not port or not token:
-        hub_url = os.environ.get("SS_HUB_URL", "").rstrip("/")
-        if not port and hub_url and ":" in hub_url:
-            port = hub_url.rsplit(":", 1)[1]
-        if not token:
-            token = os.environ.get("SS_HUB_TOKEN", "")
-    return port, token
+    if not port and url_port:
+        port = url_port
+    if not token:
+        token = os.environ.get("SS_HUB_TOKEN", "")
+    return "127.0.0.1", port, token
 
 
 def api(method, path, body=None):
     """调 hub HTTP API;成功返回 dict,失败抛 RuntimeError(带 hub 侧错误信息)。"""
-    port, token = load_hub()
+    host, port, token = load_hub()
     if not port:
         raise RuntimeError("会话监控面板未运行:先执行 share hub start")
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
+        f"http://{host}:{port}{path}",
         data=json.dumps(body).encode() if body is not None else None, method=method)
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Share-API", "1")
@@ -82,9 +95,8 @@ def api(method, path, body=None):
 
 
 def hub_base_url():
-    ip = "127.0.0.1"
-    port, _ = load_hub()
-    return f"http://{ip}:{port}"
+    host, port, _ = load_hub()
+    return f"http://{host}:{port}"
 
 
 # ---------------------------------------------------------------- 工具实现

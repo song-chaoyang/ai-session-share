@@ -505,6 +505,52 @@ else
     bad "MCP 测试失败: ${MCP_OUT:-无输出}"
 fi
 
+# --- 29b. MCP 跨设备(远端 SS_HUB_URL):模拟"另一台设备的 AI 驱动本机面板" ---
+# SS_HUB_URL 非本机时 mcp_server 走远端分支:host 取 SS_HUB_URL,token 只认 SS_HUB_TOKEN
+# (对端面板的 token 不在本机 hub.state 里,必须经环境变量透传——即 mcp_register 的 _hub_env)
+say "MCP 跨设备(远端 SS_HUB_URL)"
+MCP_XDEV_OUT="$(SS_STATE_DIR="$STATE_DIR" SS_HUB_URL="http://127.0.0.1:$HUB_PORT" SS_HUB_TOKEN="$HUB_TOKEN" \
+python3 - <<'PYEOF' 2>/dev/null
+import json, subprocess, time
+
+def rpc(msgs):
+    stdin = "\n".join(json.dumps(m) for m in msgs) + "\n"
+    r = subprocess.run(["python3", "mcp_server.py"], input=stdin,
+                       capture_output=True, text=True, timeout=60)
+    return [json.loads(l) for l in r.stdout.strip().splitlines()]
+
+fails = []
+rs = rpc([{"jsonrpc":"2.0","id":1,"method":"tools/call",
+           "params":{"name":"spawn_session","arguments":{"command":"bash -c 'echo XDEV_OK; sleep 30'"}}}]
+)
+text = rs[0]["result"]["content"][0]["text"]
+if "托管会话已创建" not in text:
+    fails.append("xdev spawn: " + text[:80])
+sid = text.split("托管会话已创建: ")[1].split("\n")[0]
+
+time.sleep(0.6)
+rpc([{"jsonrpc":"2.0","id":2,"method":"tools/call",
+      "params":{"name":"send_input","arguments":{"session_id":sid,"text":"echo XDEV_W_OK\r"}}}])
+time.sleep(0.8)
+r = rpc([{"jsonrpc":"2.0","id":3,"method":"tools/call",
+          "params":{"name":"read_output","arguments":{"session_id":sid}}}])
+if "XDEV_W_OK" not in r[0]["result"]["content"][0]["text"]:
+    fails.append("xdev send/read roundtrip")
+
+r = rpc([{"jsonrpc":"2.0","id":4,"method":"tools/call",
+          "params":{"name":"kill_session","arguments":{"session_id":sid}}}])
+if "已请求结束" not in r[0]["result"]["content"][0]["text"]:
+    fails.append("xdev kill: " + r[0]["result"]["content"][0]["text"][:80])
+
+print("FAIL:" + ";".join(fails) if fails else "XDEV_OK")
+PYEOF
+)"
+if [[ "$MCP_XDEV_OUT" == "XDEV_OK" ]]; then
+    ok "MCP 跨设备远端面板 spawn/send/read/kill 全过(远端 token 经环境变量认证)"
+else
+    bad "MCP 跨设备测试失败: ${MCP_XDEV_OUT:-无输出}"
+fi
+
 # --- 30. 全局发现:share sessions / SS_HUB_URL / 注册器幂等 ---
 say "全局发现与注册"
 if SS_HUB_PORT="$HUB_PORT" "$SHARE" sessions 2>/dev/null | grep -q "ai-session-share 活动会话"; then
