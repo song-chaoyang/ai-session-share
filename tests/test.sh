@@ -551,6 +551,64 @@ else
     bad "MCP 跨设备测试失败: ${MCP_XDEV_OUT:-无输出}"
 fi
 
+# --- 29c. share mcp config / share mcp(stdio 启动) ---
+say "share mcp 子命令(config 默认带鉴权 / stdio 服务器)"
+MCP_CFG_OUT="$("$SHARE" mcp config 2>/dev/null)"
+if [[ "$MCP_CFG_OUT" == *"mcp_server.py"* ]] && [[ "$MCP_CFG_OUT" == *"SS_HUB_URL"* ]] \
+    && [[ "$MCP_CFG_OUT" == *"$HUB_TOKEN"* ]]; then
+    ok "share mcp config 输出配置且内嵌当前面板 token(默认鉴权)"
+else
+    bad "share mcp config 输出异常: ${MCP_CFG_OUT:0:120}"
+fi
+# 解析配置 JSON 并用它初始化 stdio 服务器(验证配置可直接被 MCP 客户端使用)
+MCP_CFG_JSON="$(echo "$MCP_CFG_OUT" | python3 -c 'import sys; s=sys.stdin.read(); print(s[s.index("{"):s.rindex("}")+1] if "{" in s else "")' 2>/dev/null)"
+MCP_SRV_OUT="$(MCP_CFG_JSON="$MCP_CFG_JSON" python3 - <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys
+cfg = json.loads(os.environ.get("MCP_CFG_JSON") or "{}")
+env = dict(os.environ)
+env.update(cfg.get("env", {}))
+reqs = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+]
+stdin = "\n".join(json.dumps(m) for m in reqs) + "\n"
+r = subprocess.run([cfg["command"], *cfg["args"]], input=stdin,
+                   capture_output=True, text=True, timeout=60, env=env)
+out = r.stdout
+ok_init = '"protocolVersion"' in out
+ok_tools = '"list_sessions"' in out and '"kill_session"' in out
+print("SRV_OK" if (ok_init and ok_tools) else "SRV_FAIL")
+PYEOF
+)"
+if [[ "$MCP_SRV_OUT" == "SRV_OK" ]]; then
+    ok "配置可直接拉起 stdio MCP 服务器(initialize + tools/list 正常)"
+else
+    bad "配置拉起 MCP 服务器失败: ${MCP_CFG_JSON:0:120}"
+fi
+# hook /share_session mcp 形态:模板展开($ARGUMENTS→mcp)应追加 MCP 配置
+HOOK_MCP_OUT="$(python3 - <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys
+prompt = ("把当前终端会话共享成局域网 Web 服务,让局域网内其他人用浏览器实时查看并继续操作这个会话。\n\n"
+          "用户输入的参数(原样透传给 hook 识别):mcp\n")
+env = dict(os.environ)
+env["SS_STATE_DIR"] = os.environ["SS_STATE_DIR"]
+env["SS_HOOK_VIEW_ONLY"] = "1"
+r = subprocess.run([sys.executable, "hooks/share_session_hook.py"],
+                   input=json.dumps({"prompt": prompt}),
+                   capture_output=True, text=True, timeout=60, env=env)
+try:
+    t = json.loads(r.stdout)["reason"]
+    print("HOOK_MCP_OK" if "mcp_server.py" in t else "HOOK_MCP_MISSING")
+except (ValueError, KeyError):
+    print("HOOK_MCP_NOOUT")
+PYEOF
+)"
+if [[ "$HOOK_MCP_OUT" == "HOOK_MCP_OK" ]]; then
+    ok "hook 识别 /share_session mcp 参数并追加 MCP 配置"
+else
+    bad "hook mcp 参数分支异常: ${HOOK_MCP_OUT:-无输出}"
+fi
+
 # --- 30. 全局发现:share sessions / SS_HUB_URL / 注册器幂等 ---
 say "全局发现与注册"
 if SS_HUB_PORT="$HUB_PORT" "$SHARE" sessions 2>/dev/null | grep -q "ai-session-share 活动会话"; then

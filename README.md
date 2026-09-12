@@ -71,6 +71,7 @@ share new claude
 | atomcode | `/share_session` | 直接输出访问链接、账号密码(**零 token,不经模型**) |
 | claude | `/share_session` | 同上 |
 | codex | `/prompts:share_session` | 同上(codex 的自定义命令带 `prompts:` 前缀) |
+| 任意 | `/share_session mcp` | 共享链接**之外额外输出 MCP 客户端配置**(默认带鉴权 token):任意支持 MCP 的 AI 客户端粘贴该配置后,即可在对话里 list/spawn/send/read/kill 本机会话;等价于 `share mcp config` |
 
 **零 token 原理。** `./install.sh -y` 同时会给各工具注册一个 `UserPromptSubmit` hook。输入 `/share_session` 时,
 hook 在**模型介入前**直接执行共享命令,并把链接通过 `{"decision":"block"}` 原样返回给用户——LLM 完全不参与
@@ -274,6 +275,7 @@ share new claude ──► 面板在 PTY 中 fork claude(设置 SS_MANAGED_ID)
 | `share kill <id>` | 强制结束托管会话(进程组 TERM→KILL 升级) |
 | `share status` / `share url` | 查看面板状态与认证信息 / 重新打印访问链接 |
 | `share hub [action]` | 会话监控面板:`start`/`stop`/`status`/`url`(默认 `start`,端口 7690) |
+| `share mcp [config]` | MCP 服务器:无参数启动 stdio 服务器(等价 `python3 mcp_server.py`);`config` 打印可直接粘贴进 AI 客户端的 MCP 配置(**默认带鉴权 token**) |
 | `share sessions` | 全局查看所有活动中的会话与状态(托管 / Claude / atomcode) |
 | `share doctor` | 环境自检(依赖/端口/局域网 IP) |
 | `share help` | 帮助 |

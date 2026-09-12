@@ -30,6 +30,7 @@ MARKERS = (
     "/share_session",
     "把当前终端会话共享成局域网 Web 服务",
     "局域网访问链接",
+    "$ARGUMENTS",
 )
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -42,6 +43,27 @@ SHARE_SH = REPO_DIR / "share.sh"
 
 def hit(prompt: str) -> bool:
     return any(m in prompt for m in MARKERS)
+
+
+def wants_mcp(prompt: str) -> bool:
+    """/share_session mcp [config] → 额外输出 MCP 客户端配置(默认带鉴权)。
+
+    兼容两种展开形态:
+    - 原样命令串:行首 "/share_session mcp …";
+    - 模板被工具替换 $ARGUMENTS 后:"用户输入的参数(原样透传给 hook 识别):mcp"。
+    """
+    for ln in prompt.splitlines():
+        s = ln.strip()
+        if s.startswith("/share_session"):
+            parts = s.split()
+            if len(parts) > 1 and parts[1].lower().rstrip("。.") == "mcp":
+                return True
+        if s.startswith("用户输入的参数"):
+            tail = s.split(":", 1)[-1].split("：", 1)[-1].strip()
+            parts = tail.split()
+            if parts and parts[0].lower().rstrip("。.") == "mcp":
+                return True
+    return False
 
 
 def run(cmd, timeout=40):
@@ -236,6 +258,14 @@ def main() -> None:
     out = ANSI_RE.sub("", build_links()).strip()
     if not out:
         out = "[share] 共享失败:请确认已运行 ./install.sh -y"
+    # /share_session mcp [config] → 追加 MCP 客户端配置(默认带鉴权 token)
+    if wants_mcp(prompt):
+        rc, mcp_out = run(["bash", str(SHARE_SH), "mcp", "config"]
+                          if SHARE_SH.exists() else ["share", "mcp", "config"], timeout=20)
+        if rc == 0 and mcp_out.strip():
+            out += "\n" + ANSI_RE.sub("", mcp_out).strip()
+        else:
+            out += "\n[share]   (MCP 配置获取失败:请手动执行 share mcp config)"
     # block:不调用 LLM,直接把链接展示给用户
     print(json.dumps({"decision": "block", "reason": out}, ensure_ascii=False))
 

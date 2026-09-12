@@ -17,6 +17,8 @@
 #   share.sh status         查看面板状态与认证信息
 #   share.sh url            打印面板访问链接与认证信息
 #   share.sh hub [action]   会话监控面板（start/stop/status/url，默认 start）
+#   share.sh mcp [config]   MCP 服务器（stdio，等价 python3 mcp_server.py）；
+#                           mcp config = 打印 MCP 客户端配置（默认带鉴权 token）
 #   share.sh doctor         环境自检
 #   share.sh help           显示帮助
 #
@@ -347,6 +349,41 @@ cmd_sessions() {
     python3 "${REPO_DIR}/hub_server.py" api sessions
 }
 
+# ---------- MCP 服务器（stdio JSON-RPC，供任意 MCP 客户端查看/操作会话）----------
+# `share mcp`        = 启动 stdio MCP 服务器（等价 python3 mcp_server.py，由客户端拉起，不进 main 分发之外的逻辑）
+# `share mcp config` = 打印可直接粘贴进 AI 客户端的 MCP 配置；默认带鉴权
+#                      （env 里内嵌 SS_HUB_URL 与 SS_HUB_TOKEN——token 来自运行中面板，
+#                        与 hub.state 一致；SS_NO_AUTH=1 时输出无 token 配置）
+cmd_mcp() {
+    local action="${1:-}"
+    case "$action" in
+        config)
+            need_cmds python3
+            hub_load_state
+            local port="${HUB_STATE_PORT:-$HUB_PORT}"
+            local token="${HUB_STATE_TOKEN:-}"
+            local exe
+            exe="$(command -v python3)"
+            python3 - "$REPO_DIR/mcp_server.py" "$exe" "$port" "$token" <<'PYEOF'
+import json, sys
+mcp_py, exe, port, token = sys.argv[1:5]
+env = {"SS_HUB_URL": f"http://127.0.0.1:{port}"}
+if token:
+    env["SS_HUB_TOKEN"] = token   # 鉴权:面板 token,仅本用户可读;勿泄露
+cfg = {"type": "stdio", "command": exe, "args": [mcp_py], "env": env}
+print("MCP 客户端配置(粘贴进 mcpServers / 对应客户端配置,默认带鉴权):")
+print(json.dumps(cfg, ensure_ascii=False, indent=2))
+PYEOF
+            ;;
+        "")
+            exec python3 "${REPO_DIR}/mcp_server.py"
+            ;;
+        *)
+            die "未知 mcp 子命令: $action（可用 config 或无参数启动 stdio 服务器）"
+            ;;
+    esac
+}
+
 cmd_doctor() {
     echo "═══ 环境自检 ═══"
     local c ver
@@ -391,6 +428,7 @@ main() {
         sessions) cmd_sessions ;;
         status) cmd_status ;;
         url)    cmd_url ;;
+        mcp)    cmd_mcp "${1:-}" ;;
         doctor) cmd_doctor ;;
         help|-h|--help) cmd_help ;;
         hub)

@@ -75,6 +75,7 @@ AI tool's conversation:
 | atomcode | `/share_session` | Directly prints the access link + credentials (**zero token, no model call**) |
 | claude | `/share_session` | Same |
 | codex | `/prompts:share_session` | Same (codex custom commands use the `prompts:` prefix) |
+| any | `/share_session mcp` | In addition to the share link, prints an **MCP client config (with auth token by default)**: any MCP-capable AI client can paste it and then list/spawn/send/read/kill local sessions from its conversation; equivalent to `share mcp config` |
 
 **Zero-token principle.** `./install.sh -y` also registers a `UserPromptSubmit` hook for each tool. When you type
 `/share_session`, the hook fires **before the model is invoked**, directly runs the share command and returns the
@@ -294,6 +295,7 @@ reader thread sees EOF → session ended → web page shows "会话已结束"
 | `share kill <id>` | Force-end a managed session (process-group TERM→KILL escalation) |
 | `share status` / `share url` | Show dashboard status/credentials / re-print the access link |
 | `share hub [action]` | Dashboard: `start`/`stop`/`status`/`url` (default `start`, port 7690) |
+| `share mcp [config]` | MCP server: no arg = launch the stdio server (`python3 mcp_server.py`); `config` prints a client config (with **auth token by default**) ready to paste into any MCP-capable AI client |
 | `share sessions` | Global view of every active session (managed / Claude / atomcode) |
 | `share doctor` | Environment self-check (deps / ports / LAN IP) |
 | `share help` | Help |
